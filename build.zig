@@ -52,6 +52,7 @@ pub fn build(b: *std.build.Builder) void {
         installDemo(b, triangle.build(b, options), "triangle");
         installDemo(b, minimal.build(b, options), "minimal");
         installDemo(b, procedural_mesh.build(b, options), "procedural_mesh");
+        installDemo(b, deferred.build(b, options), "deferred");
 
         comptime var intro_index: u32 = 0;
         inline while (intro_index < 7) : (intro_index += 1) {
@@ -96,6 +97,7 @@ const procedural_mesh = @import("samples/procedural_mesh/build.zig");
 const network_test = @import("samples/network_test/build.zig");
 const triangle_wgpu = @import("samples/triangle_wgpu/build.zig");
 const procedural_mesh_wgpu = @import("samples/procedural_mesh_wgpu/build.zig");
+const deferred = @import("samples/deferred/build.zig");
 
 pub const Options = struct {
     build_mode: std.builtin.Mode,
