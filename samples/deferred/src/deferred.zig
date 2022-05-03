@@ -13,6 +13,7 @@ const c = common.c;
 const vm = common.vectormath;
 const GuiRenderer = common.GuiRenderer;
 const zpix = @import("zpix");
+const zmesh = @import("zmesh");
 
 const Vec2 = vm.Vec2;
 const Vec3 = vm.Vec3;
@@ -28,6 +29,28 @@ const window_name = "zig-gamedev: deferred";
 const window_width = 1920;
 const window_height = 1080;
 
+const PsoZPrePass_DrawRootConst = struct {
+    vertex_offset: u32,
+    index_offset: u32,
+};
+
+const PsoZPrePass_SceneConst = struct {
+    world_to_clip: Mat4,
+    position_buffer_index: u32,
+    index_buffer_index: u32,
+};
+
+const PsoZPrePass_DrawConst = struct {
+    object_to_world: Mat4,
+};
+
+const Mesh = struct {
+    index_offset: u32,
+    vertex_offset: u32,
+    num_indices: u32,
+    num_vertices: u32,
+};
+
 const DeferredSample = struct {
     gctx: zd3d12.GraphicsContext,
     guir: GuiRenderer,
@@ -39,7 +62,15 @@ const DeferredSample = struct {
     depth_texture_srv: d3d12.CPU_DESCRIPTOR_HANDLE,
 
     // PSOs
+    z_pre_pass_pso: zd3d12.PipelineHandle,
     debug_view_pso: zd3d12.PipelineHandle,
+
+    // Geometry Data
+    position_buffer: zd3d12.ResourceHandle,
+    position_buffer_descriptor: zd3d12.PersistentDescriptor,
+    index_buffer: zd3d12.ResourceHandle,
+    index_buffer_descriptor: zd3d12.PersistentDescriptor,
+    meshes: std.ArrayList(Mesh),
 
     camera: struct {
         position: Vec3,
@@ -70,8 +101,26 @@ const DeferredSample = struct {
         var gctx = zd3d12.GraphicsContext.init(allocator, window);
 
         // Initialize PSOs
+        // Z-PrePass
+        const z_pre_pass_pso = blk: {
+            var pso_desc = d3d12.GRAPHICS_PIPELINE_STATE_DESC.initDefault();
+            pso_desc.RTVFormats[0] = .UNKNOWN;
+            pso_desc.NumRenderTargets = 0;
+            pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0x0;
+            pso_desc.DSVFormat = .D32_FLOAT;
+            pso_desc.PrimitiveTopologyType = .TRIANGLE;
+
+            break :blk gctx.createGraphicsShaderPipeline(
+                arena_allocator,
+                &pso_desc,
+                content_dir ++ "shaders/z_pre_pass.vs.cso",
+                content_dir ++ "shaders/z_pre_pass.ps.cso",
+            );
+        };
+
         // Debug View PSO
         const debug_view_pso = blk: {
+            // NOTE: This causes a warning because we're not binding a depth buffer.
             var pso_desc = d3d12.GRAPHICS_PIPELINE_STATE_DESC.initDefault();
             pso_desc.RTVFormats[0] = .R8G8B8A8_UNORM;
             pso_desc.NumRenderTargets = 1;
@@ -128,6 +177,127 @@ const DeferredSample = struct {
 
         var guir = GuiRenderer.init(arena_allocator, &gctx, 1, content_dir);
 
+        // Load Sponza
+        const geometry = blk: {
+            zmesh.init(arena_allocator);
+            defer zmesh.deinit();
+
+            var meshes = std.ArrayList(Mesh).init(allocator);
+
+            const data_handle = try zmesh.gltf.parseAndLoadFile(content_dir ++ "Sponza/Sponza.gltf");
+            defer zmesh.gltf.freeData(data_handle);
+
+            var indices = std.ArrayList(u32).init(arena_allocator);
+            var positions = std.ArrayList([3]f32).init(arena_allocator);
+
+            const num_meshes = zmesh.gltf.getNumMeshes(data_handle);
+            var mesh_index: u32 = 0;
+            while (mesh_index < num_meshes) : (mesh_index += 1) {
+                const num_primitives = zmesh.gltf.getNumMeshPrimitives(data_handle, mesh_index);
+                var primitive_index: u32 = 0;
+                while (primitive_index < num_primitives) : (primitive_index += 1) {
+                    const pre_indices_len = indices.items.len;
+                    const pre_positions_len = positions.items.len;
+
+                    zmesh.gltf.appendMeshPrimitive(
+                        data_handle,
+                        mesh_index,
+                        primitive_index,
+                        &indices,
+                        &positions,
+                        null,
+                        null,
+                        null,
+                    );
+
+                    meshes.append(.{
+                        .index_offset = @intCast(u32, pre_indices_len),
+                        .vertex_offset = @intCast(u32, pre_positions_len),
+                        .num_indices = @intCast(u32, indices.items.len - pre_indices_len),
+                        .num_vertices = @intCast(u32, positions.items.len - pre_positions_len),
+                    }) catch unreachable;
+                }
+            }
+
+            // Create Position Buffer, a persisten view and upload all positions to the GPU
+            const position_buffer = gctx.createCommittedResource(
+                .DEFAULT,
+                d3d12.HEAP_FLAG_NONE,
+                &d3d12.RESOURCE_DESC.initBuffer(positions.items.len * @sizeOf([3]f32)),
+                d3d12.RESOURCE_STATE_COPY_DEST,
+                null,
+            ) catch |err| hrPanic(err);
+            const position_buffer_descriptor = gctx.allocatePersistentGpuDescriptors(1);
+            gctx.device.CreateShaderResourceView(
+                gctx.lookupResource(position_buffer).?,
+                &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(
+                    0,
+                    @intCast(u32, positions.items.len),
+                    @sizeOf([3]f32),
+                ),
+                position_buffer_descriptor.cpu_handle,
+            );
+
+            {
+                const upload = gctx.allocateUploadBufferRegion([3]f32, @intCast(u32, positions.items.len));
+                for (positions.items) |position, i| {
+                    upload.cpu_slice[i] = position;
+                }
+                gctx.cmdlist.CopyBufferRegion(
+                    gctx.lookupResource(position_buffer).?,
+                    0,
+                    upload.buffer,
+                    upload.buffer_offset,
+                    upload.cpu_slice.len * @sizeOf(@TypeOf(upload.cpu_slice[0])),
+                );
+                gctx.addTransitionBarrier(position_buffer, d3d12.RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                gctx.flushResourceBarriers();
+            }
+
+            // Create Index Buffer, a persistent view and upload all indices to the GPU
+            const index_buffer = gctx.createCommittedResource(
+                .DEFAULT,
+                d3d12.HEAP_FLAG_NONE,
+                &d3d12.RESOURCE_DESC.initBuffer(indices.items.len * @sizeOf(u32)),
+                d3d12.RESOURCE_STATE_COPY_DEST,
+                null,
+            ) catch |err| hrPanic(err);
+            const index_buffer_descriptor = gctx.allocatePersistentGpuDescriptors(1);
+            gctx.device.CreateShaderResourceView(
+                gctx.lookupResource(index_buffer).?,
+                &d3d12.SHADER_RESOURCE_VIEW_DESC.initTypedBuffer(
+                    .R32_UINT,
+                    0,
+                    @intCast(u32, indices.items.len),
+                ),
+                index_buffer_descriptor.cpu_handle,
+            );
+
+            {
+                const upload = gctx.allocateUploadBufferRegion(u32, @intCast(u32, indices.items.len));
+                for (indices.items) |index, i| {
+                    upload.cpu_slice[i] = index;
+                }
+                gctx.cmdlist.CopyBufferRegion(
+                    gctx.lookupResource(index_buffer).?,
+                    0,
+                    upload.buffer,
+                    upload.buffer_offset,
+                    upload.cpu_slice.len * @sizeOf(@TypeOf(upload.cpu_slice[0])),
+                );
+                gctx.addTransitionBarrier(index_buffer, d3d12.RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                gctx.flushResourceBarriers();
+            }
+
+            break :blk .{
+                .meshes = meshes,
+                .position_buffer = position_buffer,
+                .position_buffer_descriptor = position_buffer_descriptor,
+                .index_buffer = index_buffer,
+                .index_buffer_descriptor = index_buffer_descriptor,
+            };
+        };
+
         gctx.endFrame();
         gctx.finishGpuCommands();
 
@@ -143,6 +313,13 @@ const DeferredSample = struct {
             .depth_texture_srv = depth_texture_srv,
 
             .debug_view_pso = debug_view_pso,
+            .z_pre_pass_pso = z_pre_pass_pso,
+
+            .meshes = geometry.meshes,
+            .position_buffer = geometry.position_buffer,
+            .position_buffer_descriptor = geometry.position_buffer_descriptor,
+            .index_buffer = geometry.index_buffer,
+            .index_buffer_descriptor = geometry.index_buffer_descriptor,
 
             .camera = .{
                 .position = Vec3.init(0.0, 1.0, 0.0),
@@ -164,6 +341,7 @@ const DeferredSample = struct {
         sample.gctx.deinit(allocator);
         common.deinitWindow(allocator);
 
+        sample.meshes.deinit();
         sample.* = undefined;
     }
 
@@ -241,7 +419,6 @@ const DeferredSample = struct {
             50.0,
         );
         const cam_world_to_clip = cam_world_to_view.mul(cam_view_to_clip);
-        _ = cam_world_to_clip;
 
         // Z-PrePass
         {
@@ -257,6 +434,28 @@ const DeferredSample = struct {
             gctx.cmdlist.ClearDepthStencilView(sample.depth_texture_dsv, d3d12.CLEAR_FLAG_DEPTH, 1.0, 0, 0, null);
 
             gctx.cmdlist.IASetPrimitiveTopology(.TRIANGLELIST);
+
+            // Set scene constants
+            const scene_const_mem = gctx.allocateUploadMemory(PsoZPrePass_SceneConst, 1);
+            scene_const_mem.cpu_slice[0] = .{
+                .world_to_clip = cam_world_to_clip.transpose(),
+                .position_buffer_index = sample.position_buffer_descriptor.index,
+                .index_buffer_index = sample.index_buffer_descriptor.index,
+            };
+
+            gctx.setCurrentPipeline(sample.z_pre_pass_pso);
+            gctx.cmdlist.SetGraphicsRootConstantBufferView(1, scene_const_mem.gpu_base);
+
+            for (sample.meshes.items) |mesh| {
+                gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
+                // TODO: Replace this with a storage buffer?
+                const draw_const_mem = gctx.allocateUploadMemory(PsoZPrePass_DrawConst, 1);
+                draw_const_mem.cpu_slice[0] = .{
+                    .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
+                };
+                gctx.cmdlist.SetGraphicsRootConstantBufferView(2, draw_const_mem.gpu_base);
+                gctx.cmdlist.DrawInstanced(mesh.num_indices, 1, 0, 0);
+            }
         }
 
         const back_buffer = gctx.getBackBuffer();

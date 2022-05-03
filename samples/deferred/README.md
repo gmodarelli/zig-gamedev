@@ -4,7 +4,7 @@ This sample implements a basic Deferred Renderer.
 
 ### Passes
 
-- [ ] Depth Pre-Pass
+- [ ] Z Pre-Pass
 - [ ] Main Light Shadow Pass?
 - [ ] GBuffer Pass
 - [ ] Lighting Pass?

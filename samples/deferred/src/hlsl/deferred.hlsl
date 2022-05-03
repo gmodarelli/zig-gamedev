@@ -13,12 +13,12 @@ struct DrawRootConst {
 
 struct SceneConst {
     float4x4 world_to_clip;
+    uint position_buffer_index;
+    uint index_buffer_index;
 };
 
 struct DrawConst {
     float4x4 object_to_world;
-    uint position_buffer_index;
-    uint index_buffer_index;
 };
 
 ConstantBuffer<DrawRootConst> cbv_draw_root : register(b0);
@@ -30,8 +30,8 @@ void vsZPrePass(
     uint vertex_id : SV_VertexID,
     out float4 out_position_clip : SV_Position
 ) {
-    StructuredBuffer<float3> srv_position_buffer = ResourceDescriptorHeap[cbv_draw_const.position_buffer_index];
-    Buffer<uint> srv_index_buffer = ResourceDescriptorHeap[cbv_draw_const.index_buffer_index];
+    StructuredBuffer<float3> srv_position_buffer = ResourceDescriptorHeap[cbv_scene_const.position_buffer_index];
+    Buffer<uint> srv_index_buffer = ResourceDescriptorHeap[cbv_scene_const.index_buffer_index];
 
     const uint vertex_index = srv_index_buffer[vertex_id + cbv_draw_root.index_offset] + cbv_draw_root.vertex_offset;
     const float3 position_os = srv_position_buffer[vertex_index];
