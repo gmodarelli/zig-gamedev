@@ -33,6 +33,14 @@ const DeferredSample = struct {
     guir: GuiRenderer,
     frame_stats: common.FrameStats,
 
+    // Depth Texture for Z Pre Pass, GBuffer Pass
+    depth_texture: zd3d12.ResourceHandle,
+    depth_texture_dsv: d3d12.CPU_DESCRIPTOR_HANDLE,
+    depth_texture_srv: d3d12.CPU_DESCRIPTOR_HANDLE,
+
+    // PSOs
+    debug_view_pso: zd3d12.PipelineHandle,
+
     camera: struct {
         position: Vec3,
         forward: Vec3,
@@ -61,6 +69,61 @@ const DeferredSample = struct {
 
         var gctx = zd3d12.GraphicsContext.init(allocator, window);
 
+        // Initialize PSOs
+        // Debug View PSO
+        const debug_view_pso = blk: {
+            var pso_desc = d3d12.GRAPHICS_PIPELINE_STATE_DESC.initDefault();
+            pso_desc.RTVFormats[0] = .R8G8B8A8_UNORM;
+            pso_desc.NumRenderTargets = 1;
+            pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+            pso_desc.PrimitiveTopologyType = .TRIANGLE;
+
+            break :blk gctx.createGraphicsShaderPipeline(
+                arena_allocator,
+                &pso_desc,
+                content_dir ++ "shaders/debug_view.vs.cso",
+                content_dir ++ "shaders/debug_view.ps.cso",
+            );
+        };
+
+        // Create Depth Texture resource and its views
+        // TODO: Figure out if there are any benifits in changing the format
+        // to D32_TYPELESS
+        // TODO: Convert to Reversed-Z buffer
+        const depth_texture = gctx.createCommittedResource(
+            .DEFAULT,
+            d3d12.HEAP_FLAG_NONE,
+            &blk: {
+                var desc = d3d12.RESOURCE_DESC.initTex2d(.D32_FLOAT, gctx.viewport_width, gctx.viewport_height, 1);
+                desc.Flags = d3d12.RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                break :blk desc;
+            },
+            d3d12.RESOURCE_STATE_DEPTH_WRITE,
+            &d3d12.CLEAR_VALUE.initDepthStencil(.D32_FLOAT, 1.0, 0),
+        ) catch |err| hrPanic(err);
+
+        const depth_texture_dsv = gctx.allocateCpuDescriptors(.DSV, 1);
+        gctx.device.CreateDepthStencilView(gctx.lookupResource(depth_texture).?, null, depth_texture_dsv);
+
+        const depth_texture_srv = gctx.allocateCpuDescriptors(.CBV_SRV_UAV, 1);
+        gctx.device.CreateShaderResourceView(
+            gctx.lookupResource(depth_texture).?,
+            &d3d12.SHADER_RESOURCE_VIEW_DESC{
+                .Format = .R32_FLOAT,
+                .ViewDimension = .TEXTURE2D,
+                .Shader4ComponentMapping = d3d12.DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                .u = .{
+                    .Texture2D = .{
+                        .MostDetailedMip = 0,
+                        .MipLevels = 1,
+                        .PlaneSlice = 0,
+                        .ResourceMinLODClamp = 0.0,
+                    },
+                },
+            },
+            depth_texture_srv
+        );
+
         gctx.beginFrame();
 
         var guir = GuiRenderer.init(arena_allocator, &gctx, 1, content_dir);
@@ -74,6 +137,13 @@ const DeferredSample = struct {
             .gctx = gctx,
             .guir = guir,
             .frame_stats = common.FrameStats.init(),
+
+            .depth_texture = depth_texture,
+            .depth_texture_dsv = depth_texture_dsv,
+            .depth_texture_srv = depth_texture_srv,
+
+            .debug_view_pso = debug_view_pso,
+
             .camera = .{
                 .position = Vec3.init(0.0, 1.0, 0.0),
                 .forward = Vec3.initZero(),
@@ -173,23 +243,57 @@ const DeferredSample = struct {
         const cam_world_to_clip = cam_world_to_view.mul(cam_view_to_clip);
         _ = cam_world_to_clip;
 
+        // Z-PrePass
+        {
+            zpix.beginEvent(gctx.cmdlist, "Z Pre Pass");
+            defer zpix.endEvent(gctx.cmdlist);
+
+            gctx.addTransitionBarrier(sample.depth_texture, d3d12.RESOURCE_STATE_DEPTH_WRITE);
+            gctx.flushResourceBarriers();
+
+            // Bind and clear the depth buffer
+            gctx.cmdlist.OMSetRenderTargets(0, null, w32.TRUE, &sample.depth_texture_dsv);
+            // TODO: Switch to Reversed-Z
+            gctx.cmdlist.ClearDepthStencilView(sample.depth_texture_dsv, d3d12.CLEAR_FLAG_DEPTH, 1.0, 0, 0, null);
+
+            gctx.cmdlist.IASetPrimitiveTopology(.TRIANGLELIST);
+        }
+
         const back_buffer = gctx.getBackBuffer();
 
-        gctx.addTransitionBarrier(back_buffer.resource_handle, d3d12.RESOURCE_STATE_RENDER_TARGET);
-        gctx.flushResourceBarriers();
+        // Debug View
+        {
+            zpix.beginEvent(gctx.cmdlist, "Debug View");
+            defer zpix.endEvent(gctx.cmdlist);
 
-        gctx.cmdlist.OMSetRenderTargets(
-            1,
-            &[_]d3d12.CPU_DESCRIPTOR_HANDLE{back_buffer.descriptor_handle},
-            w32.TRUE,
-            null,
-        );
-        gctx.cmdlist.ClearRenderTargetView(
-            back_buffer.descriptor_handle,
-            &[4]f32{ 0.0, 0.0, 0.0, 1.0 },
-            0,
-            null,
-        );
+            // Transition the depth buffer from Depth attachment to "Texture" attachment
+            gctx.addTransitionBarrier(sample.depth_texture, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            // Transition the back buffer to render target
+            gctx.addTransitionBarrier(back_buffer.resource_handle, d3d12.RESOURCE_STATE_RENDER_TARGET);
+            gctx.flushResourceBarriers();
+
+            gctx.cmdlist.OMSetRenderTargets(
+                1,
+                &[_]d3d12.CPU_DESCRIPTOR_HANDLE{back_buffer.descriptor_handle},
+                w32.TRUE,
+                null,
+            );
+            gctx.cmdlist.ClearRenderTargetView(
+                back_buffer.descriptor_handle,
+                &[4]f32{ 0.0, 0.0, 0.0, 1.0 },
+                0,
+                null,
+            );
+
+            gctx.setCurrentPipeline(sample.debug_view_pso);
+            gctx.cmdlist.SetGraphicsRootDescriptorTable(0, blk: {
+                const table = gctx.copyDescriptorsToGpuHeap(1, sample.depth_texture_srv);
+                // TODO: Add other GBuffer textures
+                // _ = gctx.copyDescriptorsToGpuHeap(1, gbuffer0_srv);
+                break :blk table;
+            });
+            gctx.cmdlist.DrawInstanced(3, 1, 0, 0);
+        }
 
         sample.guir.draw(gctx);
 

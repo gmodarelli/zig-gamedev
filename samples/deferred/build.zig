@@ -80,7 +80,41 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
-    // TODO: Compile deferred sample shaders here
+    dxc_command = makeDxcCmd(
+        "src/hlsl/deferred.hlsl",
+        "vsZPrePass",
+        "z_pre_pass.vs.cso",
+        "vs",
+        "PSO__Z_PRE_PASS",
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "src/hlsl/deferred.hlsl",
+        "psZPrePass",
+        "z_pre_pass.ps.cso",
+        "ps",
+        "PSO__Z_PRE_PASS",
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "src/hlsl/deferred.hlsl",
+        "vsDebugView",
+        "debug_view.vs.cso",
+        "vs",
+        "PSO__DEBUG_VIEW",
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "src/hlsl/deferred.hlsl",
+        "psDebugView",
+        "debug_view.ps.cso",
+        "ps",
+        "PSO__DEBUG_VIEW",
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
     return dxc_step;
 }
