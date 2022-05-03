@@ -48,14 +48,17 @@ void psZPrePass(
 
 #elif defined(PSO__DEBUG_VIEW)
 
-// TODO: Add a root constant so we can pass which view we want to debug
-// "RootConstants(b0, num32BitConstants = 2)"
-
 #define root_signature \
     "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), " \
+    "RootConstants(b0, num32BitConstants = 1), " \
     "DescriptorTable(SRV(t0, numDescriptors = 1), visibility = SHADER_VISIBILITY_PIXEL), " \
     "StaticSampler(s0, filter = FILTER_ANISOTROPIC, maxAnisotropy = 16, visibility = SHADER_VISIBILITY_PIXEL)"
 
+struct DrawRootConst {
+    int view_mode;
+};
+
+ConstantBuffer<DrawRootConst> cbv_draw_root : register(b0);
 Texture2D srv_z_texture : register(t0);
 SamplerState sam_aniso : register(s0);
 
@@ -75,8 +78,24 @@ void psDebugView(
     float2 uvs : TEXCOORD0,
     out float4 out_color : SV_Target0
 ) {
-    // TODO: Sample srv_z_texture
-    out_color = float4(uvs.x, uvs.y, 0.0, 1.0);
+    if (cbv_draw_root.view_mode == 0) {
+        out_color = float4(uvs, 0.0, 1.0);
+    } else if (cbv_draw_root.view_mode == 1) {
+        float depth = srv_z_texture.Sample(sam_aniso, uvs).r;
+        out_color = float4(depth, depth, depth, 1.0) ;
+    } else if (cbv_draw_root.view_mode == 2) {
+        float3 albedo = float3(1, 0, 0); // TODO: Sample albedo
+        out_color = float4(albedo, 1.0) ;
+    } else if (cbv_draw_root.view_mode == 3) {
+        float3 normal_ws = float3(0, 1, 0); // TODO: Sample world space normals
+        out_color = float4(normal_ws, 1.0) ;
+    } else if (cbv_draw_root.view_mode == 4) {
+        float3 metalness = float3(0, 0, 1); // TODO: Sample metalness
+        out_color = float4(metalness, 1.0) ;
+    } else if (cbv_draw_root.view_mode == 5) {
+        float3 roughness = float3(1, 1, 0); // TODO: Sample roughness
+        out_color = float4(roughness, 1.0) ;
+    }
 }
 
 #endif

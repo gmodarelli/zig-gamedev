@@ -15,9 +15,7 @@ const GuiRenderer = common.GuiRenderer;
 const zpix = @import("zpix");
 const zmesh = @import("zmesh");
 
-const Vec2 = vm.Vec2;
 const Vec3 = vm.Vec3;
-const Vec4 = vm.Vec4;
 const Mat4 = vm.Mat4;
 
 pub export const D3D12SDKVersion: u32 = 4;
@@ -71,6 +69,8 @@ const DeferredSample = struct {
     index_buffer: zd3d12.ResourceHandle,
     index_buffer_descriptor: zd3d12.PersistentDescriptor,
     meshes: std.ArrayList(Mesh),
+
+    view_mode: i32,
 
     camera: struct {
         position: Vec3,
@@ -321,6 +321,8 @@ const DeferredSample = struct {
             .index_buffer = geometry.index_buffer,
             .index_buffer_descriptor = geometry.index_buffer_descriptor,
 
+            .view_mode = 0,
+
             .camera = .{
                 .position = Vec3.init(0.0, 1.0, 0.0),
                 .forward = Vec3.initZero(),
@@ -350,6 +352,14 @@ const DeferredSample = struct {
 
         common.newImGuiFrame(sample.frame_stats.delta_time);
 
+        _ = c.igBegin("Demo Settings", null, 0);
+        _ = c.igRadioButton_IntPtr("Default", &sample.view_mode, 0);
+        _ = c.igRadioButton_IntPtr("Depth", &sample.view_mode, 1);
+        _ = c.igRadioButton_IntPtr("Albedo", &sample.view_mode, 2);
+        _ = c.igRadioButton_IntPtr("World Space Normals", &sample.view_mode, 3);
+        _ = c.igRadioButton_IntPtr("Metalness", &sample.view_mode, 4);
+        _ = c.igRadioButton_IntPtr("Roughness", &sample.view_mode, 5);
+        c.igEnd();
         // Handle camera rotation with mouse.
         {
             var pos: w32.POINT = undefined;
@@ -485,7 +495,13 @@ const DeferredSample = struct {
             );
 
             gctx.setCurrentPipeline(sample.debug_view_pso);
-            gctx.cmdlist.SetGraphicsRootDescriptorTable(0, blk: {
+            gctx.cmdlist.SetGraphicsRoot32BitConstants(
+                0,
+                1,
+                &[_]i32{ sample.view_mode },
+                0,
+            );
+            gctx.cmdlist.SetGraphicsRootDescriptorTable(1, blk: {
                 const table = gctx.copyDescriptorsToGpuHeap(1, sample.depth_texture_srv);
                 // TODO: Add other GBuffer textures
                 // _ = gctx.copyDescriptorsToGpuHeap(1, gbuffer0_srv);
