@@ -4,13 +4,13 @@ This sample implements a basic Deferred Renderer.
 
 ### Passes
 
-- [ ] Z Pre-Pass
+- [x] Z Pre-Pass
 - [ ] Main Light Shadow Pass?
-- [ ] GBuffer Pass
+- [x] GBuffer Pass
 - [ ] Lighting Pass?
 - [ ] Post-Processing?
 - [ ] Final Blit
-- [ ] Debug View Pass (Albedo, Normals, Metallic, Roughness)
+- [x] Debug View Pass (Albedo, Normals, Metallic, Roughness)
 
 ### Some other, random notes
 
