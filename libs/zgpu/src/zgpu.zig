@@ -16,6 +16,11 @@ pub const cimgui = @cImport({
 pub const gpu = @import("mach-gpu/main.zig");
 const wgsl = @import("common_wgsl.zig");
 
+pub const SwapChainState = enum {
+    normal,
+    swap_chain_resized,
+};
+
 pub const GraphicsContext = struct {
     native_instance: gpu.NativeInstance,
     adapter_type: gpu.Adapter.Type,
@@ -44,6 +49,8 @@ pub const GraphicsContext = struct {
         scratch_texture_views: [4]TextureViewHandle = [_]TextureViewHandle{.{}} ** 4,
         bind_group_layout: BindGroupLayoutHandle = .{},
     } = .{},
+
+    stats: FrameStats = .{},
 
     pub const swapchain_format = gpu.Texture.Format.bgra8_unorm;
     // TODO: Adjust pool sizes.
@@ -136,7 +143,6 @@ pub const GraphicsContext = struct {
     }
 
     pub fn deinit(gctx: *GraphicsContext, allocator: std.mem.Allocator) void {
-        // TODO: Make sure all GPU commands are completed.
         // TODO: How to release `native_instance`?
         gctx.bind_group_pool.deinit(allocator);
         gctx.bind_group_layout_pool.deinit(allocator);
@@ -153,7 +159,10 @@ pub const GraphicsContext = struct {
         gctx.* = undefined;
     }
 
-    pub fn update(gctx: *GraphicsContext) bool {
+    pub fn present(gctx: *GraphicsContext) SwapChainState {
+        gctx.swapchain.present();
+        gctx.stats.update();
+
         const win_size = gctx.window.getSize() catch unreachable;
         const fb_size = gctx.window.getFramebufferSize() catch unreachable;
         if (gctx.swapchain_descriptor.width != fb_size.width or
@@ -179,9 +188,9 @@ pub const GraphicsContext = struct {
                     gctx.window_height,
                 },
             );
-            return false; // Swap chain has been resized.
+            return .swap_chain_resized;
         }
-        return true;
+        return .normal;
     }
 
     pub fn createBuffer(gctx: *GraphicsContext, descriptor: gpu.Buffer.Descriptor) BufferHandle {
@@ -739,7 +748,7 @@ pub fn checkContent(comptime content_dir: []const u8) !void {
     };
 }
 
-pub const FrameStats = struct {
+const FrameStats = struct {
     time: f64 = 0.0,
     delta_time: f32 = 0.0,
     fps: f32 = 0.0,
@@ -749,31 +758,23 @@ pub const FrameStats = struct {
     fps_refresh_time: f64 = 0.0,
     frame_number: u64 = 0,
 
-    pub fn update(self: *FrameStats, window: glfw.Window, window_name: []const u8) void {
-        self.time = glfw.getTime();
-        self.delta_time = @floatCast(f32, self.time - self.previous_time);
-        self.previous_time = self.time;
+    fn update(stats: *FrameStats) void {
+        stats.time = glfw.getTime();
+        stats.delta_time = @floatCast(f32, stats.time - stats.previous_time);
+        stats.previous_time = stats.time;
 
-        if ((self.time - self.fps_refresh_time) >= 1.0) {
-            const t = self.time - self.fps_refresh_time;
-            const fps = @intToFloat(f64, self.fps_counter) / t;
+        if ((stats.time - stats.fps_refresh_time) >= 1.0) {
+            const t = stats.time - stats.fps_refresh_time;
+            const fps = @intToFloat(f64, stats.fps_counter) / t;
             const ms = (1.0 / fps) * 1000.0;
 
-            self.fps = @floatCast(f32, fps);
-            self.average_cpu_time = @floatCast(f32, ms);
-            self.fps_refresh_time = self.time;
-            self.fps_counter = 0;
-
-            var buffer = [_]u8{0} ** 128;
-            const text = std.fmt.bufPrint(
-                buffer[0..],
-                "FPS: {d:.1}  CPU time: {d:.3} ms | {s}",
-                .{ self.fps, self.average_cpu_time, window_name },
-            ) catch unreachable;
-            window.setTitle(@ptrCast([*:0]const u8, text.ptr)) catch unreachable;
+            stats.fps = @floatCast(f32, fps);
+            stats.average_cpu_time = @floatCast(f32, ms);
+            stats.fps_refresh_time = stats.time;
+            stats.fps_counter = 0;
         }
-        self.fps_counter += 1;
-        self.frame_number += 1;
+        stats.fps_counter += 1;
+        stats.frame_number += 1;
     }
 };
 
