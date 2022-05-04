@@ -42,11 +42,50 @@ const PsoZPrePass_DrawConst = struct {
     object_to_world: Mat4,
 };
 
+const PsoGeometry_DrawRootConst = struct {
+    vertex_offset: u32,
+    index_offset: u32,
+};
+
+const PsoGeometryPass_SceneConst = struct {
+    world_to_clip: Mat4,
+    position_buffer_index: u32,
+    normal_buffer_index: u32,
+    texcoord_buffer_index: u32,
+    tangent_buffer_index: u32,
+    index_buffer_index: u32,
+};
+
+const PsoGeometry_DrawConst = struct {
+    object_to_world: Mat4,
+    material_index: u32,
+};
+
 const Mesh = struct {
     index_offset: u32,
     vertex_offset: u32,
     num_indices: u32,
     num_vertices: u32,
+    material_index: u32,
+};
+
+const Material = struct {
+    base_color: Vec3,
+    roughness: f32,
+    metallic: f32,
+    base_color_tex_index: u32,
+    metallic_roughness_tex_index: u32,
+    normal_tex_index: u32,
+};
+
+const Texture = struct {
+    resource: zd3d12.ResourceHandle,
+    persistent_descriptor: zd3d12.PersistentDescriptor,
+};
+
+const PersistentResource = struct {
+    resource: zd3d12.ResourceHandle,
+    persistent_descriptor: zd3d12.PersistentDescriptor,
 };
 
 const DeferredSample = struct {
@@ -64,11 +103,15 @@ const DeferredSample = struct {
     debug_view_pso: zd3d12.PipelineHandle,
 
     // Geometry Data
-    position_buffer: zd3d12.ResourceHandle,
-    position_buffer_descriptor: zd3d12.PersistentDescriptor,
-    index_buffer: zd3d12.ResourceHandle,
-    index_buffer_descriptor: zd3d12.PersistentDescriptor,
+    position_buffer: PersistentResource,
+    normal_buffer: PersistentResource,
+    texcoord_buffer: PersistentResource,
+    tangent_buffer: PersistentResource,
+    index_buffer: PersistentResource,
+
     meshes: std.ArrayList(Mesh),
+    materials: std.ArrayList(Material),
+    textures: std.ArrayList(Texture),
 
     view_mode: i32,
 
@@ -183,12 +226,17 @@ const DeferredSample = struct {
             defer zmesh.deinit();
 
             var meshes = std.ArrayList(Mesh).init(allocator);
+            var materials = std.ArrayList(Material).init(allocator);
+            var textures = std.ArrayList(Texture).init(allocator);
 
             const data_handle = try zmesh.gltf.parseAndLoadFile(content_dir ++ "Sponza/Sponza.gltf");
             defer zmesh.gltf.freeData(data_handle);
 
             var indices = std.ArrayList(u32).init(arena_allocator);
             var positions = std.ArrayList([3]f32).init(arena_allocator);
+            var normals = std.ArrayList([3]f32).init(arena_allocator);
+            var texcoords = std.ArrayList([2]f32).init(arena_allocator);
+            var tangents = std.ArrayList([4]f32).init(arena_allocator);
 
             const num_meshes = zmesh.gltf.getNumMeshes(data_handle);
             var mesh_index: u32 = 0;
@@ -205,96 +253,218 @@ const DeferredSample = struct {
                         primitive_index,
                         &indices,
                         &positions,
-                        null,
-                        null,
-                        null,
+                        &normals,
+                        &texcoords,
+                        &tangents,
                     );
+
+                    // Find material index
+                    const assigned_material_index: u32 = mt_blk: {
+                        var material_index: u32 = 0;
+                        const data = @ptrCast(
+                            *c.cgltf_data,
+                            @alignCast(@alignOf(c.cgltf_data), data_handle),
+                        );
+                        const num_materials = @intCast(u32, data.materials_count);
+
+                        while (material_index < num_materials) : (material_index += 1) {
+                            const prim = &data.meshes[mesh_index].primitives[primitive_index];
+                            if (prim.material == &data.materials[material_index]) {
+                                break :mt_blk material_index;
+                            }
+                        }
+
+                        break :mt_blk 0xffff_ffff;
+                    };
+
+                    std.debug.assert(assigned_material_index != 0xffff_ffff);
 
                     meshes.append(.{
                         .index_offset = @intCast(u32, pre_indices_len),
                         .vertex_offset = @intCast(u32, pre_positions_len),
                         .num_indices = @intCast(u32, indices.items.len - pre_indices_len),
                         .num_vertices = @intCast(u32, positions.items.len - pre_positions_len),
+                        .material_index = assigned_material_index,
                     }) catch unreachable;
                 }
             }
 
             // Create Position Buffer, a persisten view and upload all positions to the GPU
-            const position_buffer = gctx.createCommittedResource(
-                .DEFAULT,
-                d3d12.HEAP_FLAG_NONE,
+            const position_buffer = createPersistenResource(
+                &gctx,
                 &d3d12.RESOURCE_DESC.initBuffer(positions.items.len * @sizeOf([3]f32)),
-                d3d12.RESOURCE_STATE_COPY_DEST,
-                null,
-            ) catch |err| hrPanic(err);
-            const position_buffer_descriptor = gctx.allocatePersistentGpuDescriptors(1);
-            gctx.device.CreateShaderResourceView(
-                gctx.lookupResource(position_buffer).?,
                 &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(
                     0,
                     @intCast(u32, positions.items.len),
                     @sizeOf([3]f32),
                 ),
-                position_buffer_descriptor.cpu_handle,
+                d3d12.RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                [3]f32,
+                &positions,
             );
 
-            {
-                const upload = gctx.allocateUploadBufferRegion([3]f32, @intCast(u32, positions.items.len));
-                for (positions.items) |position, i| {
-                    upload.cpu_slice[i] = position;
-                }
-                gctx.cmdlist.CopyBufferRegion(
-                    gctx.lookupResource(position_buffer).?,
+            // Create Normal Buffer, a persisten view and upload all normals to the GPU
+            const normal_buffer = createPersistenResource(
+                &gctx,
+                &d3d12.RESOURCE_DESC.initBuffer(normals.items.len * @sizeOf([3]f32)),
+                &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(
                     0,
-                    upload.buffer,
-                    upload.buffer_offset,
-                    upload.cpu_slice.len * @sizeOf(@TypeOf(upload.cpu_slice[0])),
-                );
-                gctx.addTransitionBarrier(position_buffer, d3d12.RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                gctx.flushResourceBarriers();
-            }
+                    @intCast(u32, normals.items.len),
+                    @sizeOf([3]f32),
+                ),
+                d3d12.RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                [3]f32,
+                &normals,
+            );
+
+            // Create Texcoord Buffer, a persisten view and upload all texcoords to the GPU
+            const texcoord_buffer = createPersistenResource(
+                &gctx,
+                &d3d12.RESOURCE_DESC.initBuffer(texcoords.items.len * @sizeOf([2]f32)),
+                &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(
+                    0,
+                    @intCast(u32, texcoords.items.len),
+                    @sizeOf([2]f32),
+                ),
+                d3d12.RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                [2]f32,
+                &texcoords,
+            );
+
+            // Create Tangent Buffer, a persisten view and upload all tangents to the GPU
+            const tangent_buffer = createPersistenResource(
+                &gctx,
+                &d3d12.RESOURCE_DESC.initBuffer(tangents.items.len * @sizeOf([4]f32)),
+                &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(
+                    0,
+                    @intCast(u32, tangents.items.len),
+                    @sizeOf([4]f32),
+                ),
+                d3d12.RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                [4]f32,
+                &tangents,
+            );
 
             // Create Index Buffer, a persistent view and upload all indices to the GPU
-            const index_buffer = gctx.createCommittedResource(
-                .DEFAULT,
-                d3d12.HEAP_FLAG_NONE,
+            const index_buffer = createPersistenResource(
+                &gctx,
                 &d3d12.RESOURCE_DESC.initBuffer(indices.items.len * @sizeOf(u32)),
-                d3d12.RESOURCE_STATE_COPY_DEST,
-                null,
-            ) catch |err| hrPanic(err);
-            const index_buffer_descriptor = gctx.allocatePersistentGpuDescriptors(1);
-            gctx.device.CreateShaderResourceView(
-                gctx.lookupResource(index_buffer).?,
                 &d3d12.SHADER_RESOURCE_VIEW_DESC.initTypedBuffer(
                     .R32_UINT,
                     0,
                     @intCast(u32, indices.items.len),
                 ),
-                index_buffer_descriptor.cpu_handle,
+                d3d12.RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                u32,
+                &indices,
             );
 
+            // Collect Materials
             {
-                const upload = gctx.allocateUploadBufferRegion(u32, @intCast(u32, indices.items.len));
-                for (indices.items) |index, i| {
-                    upload.cpu_slice[i] = index;
-                }
-                gctx.cmdlist.CopyBufferRegion(
-                    gctx.lookupResource(index_buffer).?,
-                    0,
-                    upload.buffer,
-                    upload.buffer_offset,
-                    upload.cpu_slice.len * @sizeOf(@TypeOf(upload.cpu_slice[0])),
+                const data = @ptrCast(
+                    *c.cgltf_data,
+                    @alignCast(@alignOf(c.cgltf_data), data_handle),
                 );
-                gctx.addTransitionBarrier(index_buffer, d3d12.RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                gctx.flushResourceBarriers();
+                const num_materials = @intCast(u32, data.materials_count);
+                materials.ensureTotalCapacity(num_materials) catch unreachable;
+
+                var material_index: u32 = 0;
+                while (material_index < num_materials) : (material_index += 1) {
+                    const gltf_material = &data.materials[material_index];
+                    assert(gltf_material.has_pbr_metallic_roughness == 1);
+
+                    const mr = &gltf_material.pbr_metallic_roughness;
+
+                    const num_images = @intCast(u32, data.images_count);
+                    const invalid_image_index = num_images;
+
+                    var base_color_tex_index: u32 = invalid_image_index;
+                    var metallic_roughness_tex_index: u32 = invalid_image_index;
+                    var normal_tex_index: u32 = invalid_image_index;
+
+                    var image_index: u32 = 0;
+
+                    while (image_index < num_images) : (image_index += 1) {
+                        const image = &data.images[image_index];
+                        assert(image.uri != null);
+
+                        if (mr.base_color_texture.texture != null and
+                            mr.base_color_texture.texture.*.image.*.uri == image.uri)
+                        {
+                            assert(base_color_tex_index == invalid_image_index);
+                            base_color_tex_index = image_index;
+                        }
+
+                        if (mr.metallic_roughness_texture.texture != null and
+                            mr.metallic_roughness_texture.texture.*.image.*.uri == image.uri)
+                        {
+                            assert(metallic_roughness_tex_index == invalid_image_index);
+                            metallic_roughness_tex_index = image_index;
+                        }
+
+                        if (gltf_material.normal_texture.texture != null and
+                            gltf_material.normal_texture.texture.*.image.*.uri == image.uri)
+                        {
+                            assert(normal_tex_index == invalid_image_index);
+                            normal_tex_index = image_index;
+                        }
+                    }
+
+                    assert(base_color_tex_index != invalid_image_index);
+
+                    materials.appendAssumeCapacity(.{
+                        .base_color = Vec3.init(mr.base_color_factor[0], mr.base_color_factor[1], mr.base_color_factor[2]),
+                        .roughness = mr.roughness_factor,
+                        .metallic = mr.metallic_factor,
+                        .base_color_tex_index = @intCast(u16, base_color_tex_index),
+                        .metallic_roughness_tex_index = @intCast(u16, metallic_roughness_tex_index),
+                        .normal_tex_index = @intCast(u16, normal_tex_index),
+                    });
+                }
             }
+
+            // Upload all textures
+            {
+                const data = @ptrCast(
+                    *c.cgltf_data,
+                    @alignCast(@alignOf(c.cgltf_data), data_handle),
+                );
+
+                const num_images = @intCast(u32, data.images_count);
+                var image_index: u32 = 0;
+                textures.ensureTotalCapacity(num_images + 1) catch unreachable;
+
+                while (image_index < num_images) : (image_index += 1) {
+                    const image = &data.images[image_index];
+
+                    var buffer: [64]u8 = undefined;
+                    const path = std.fmt.bufPrint(
+                        buffer[0..],
+                        content_dir ++ "Sponza/{s}",
+                        .{image.uri},
+                    ) catch unreachable;
+
+                    const resource = gctx.createAndUploadTex2dFromFile(path, .{}) catch unreachable;
+                    // _ = gctx.lookupResource(resource).?.SetName(L(path));
+                    const view = gctx.allocatePersistentGpuDescriptors(1);
+                    gctx.device.CreateShaderResourceView(gctx.lookupResource(resource).?, null, view.cpu_handle);
+
+                    // TODO: Generate mipmaps
+                    gctx.addTransitionBarrier(resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    textures.appendAssumeCapacity(.{ .resource = resource, .persistent_descriptor = view });
+                }
+            }
+            gctx.flushResourceBarriers();
 
             break :blk .{
                 .meshes = meshes,
+                .materials = materials,
+                .textures = textures,
                 .position_buffer = position_buffer,
-                .position_buffer_descriptor = position_buffer_descriptor,
+                .normal_buffer = normal_buffer,
+                .texcoord_buffer = texcoord_buffer,
+                .tangent_buffer = tangent_buffer,
                 .index_buffer = index_buffer,
-                .index_buffer_descriptor = index_buffer_descriptor,
             };
         };
 
@@ -316,10 +486,13 @@ const DeferredSample = struct {
             .z_pre_pass_pso = z_pre_pass_pso,
 
             .meshes = geometry.meshes,
+            .materials = geometry.materials,
+            .textures = geometry.textures,
             .position_buffer = geometry.position_buffer,
-            .position_buffer_descriptor = geometry.position_buffer_descriptor,
+            .normal_buffer = geometry.normal_buffer,
+            .texcoord_buffer = geometry.texcoord_buffer,
+            .tangent_buffer = geometry.tangent_buffer,
             .index_buffer = geometry.index_buffer,
-            .index_buffer_descriptor = geometry.index_buffer_descriptor,
 
             .view_mode = 0,
 
@@ -344,6 +517,8 @@ const DeferredSample = struct {
         common.deinitWindow(allocator);
 
         sample.meshes.deinit();
+        sample.materials.deinit();
+        sample.textures.deinit();
         sample.* = undefined;
     }
 
@@ -449,8 +624,8 @@ const DeferredSample = struct {
             const scene_const_mem = gctx.allocateUploadMemory(PsoZPrePass_SceneConst, 1);
             scene_const_mem.cpu_slice[0] = .{
                 .world_to_clip = cam_world_to_clip.transpose(),
-                .position_buffer_index = sample.position_buffer_descriptor.index,
-                .index_buffer_index = sample.index_buffer_descriptor.index,
+                .position_buffer_index = sample.position_buffer.persistent_descriptor.index,
+                .index_buffer_index = sample.index_buffer.persistent_descriptor.index,
             };
 
             gctx.setCurrentPipeline(sample.z_pre_pass_pso);
@@ -516,6 +691,50 @@ const DeferredSample = struct {
         gctx.flushResourceBarriers();
 
         gctx.endFrame();
+    }
+
+    fn createPersistenResource(
+        gctx: *zd3d12.GraphicsContext,
+        resource_desc: *d3d12.RESOURCE_DESC,
+        srv_desc: *d3d12.SHADER_RESOURCE_VIEW_DESC,
+        state_after: d3d12.RESOURCE_STATES,
+        comptime T: type,
+        data: *std.ArrayList(T),
+    ) PersistentResource {
+        const resource = gctx.createCommittedResource(
+            .DEFAULT,
+            d3d12.HEAP_FLAG_NONE,
+            resource_desc,
+            d3d12.RESOURCE_STATE_COPY_DEST,
+            null,
+        ) catch |err| hrPanic(err);
+        const persistent_descriptor = gctx.allocatePersistentGpuDescriptors(1);
+        gctx.device.CreateShaderResourceView(
+            gctx.lookupResource(resource).?,
+            srv_desc,
+            persistent_descriptor.cpu_handle,
+        );
+
+        {
+            const upload = gctx.allocateUploadBufferRegion(T, @intCast(u32, data.items.len));
+            for (data.items) |element, i| {
+                upload.cpu_slice[i] = element;
+            }
+            gctx.cmdlist.CopyBufferRegion(
+                gctx.lookupResource(resource).?,
+                0,
+                upload.buffer,
+                upload.buffer_offset,
+                upload.cpu_slice.len * @sizeOf(@TypeOf(upload.cpu_slice[0])),
+            );
+            gctx.addTransitionBarrier(resource, state_after);
+            gctx.flushResourceBarriers();
+        }
+
+        return PersistentResource{
+            .resource = resource,
+            .persistent_descriptor = persistent_descriptor,
+        };
     }
 };
 
