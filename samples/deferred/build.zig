@@ -103,6 +103,24 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
 
     dxc_command = makeDxcCmd(
         "src/hlsl/deferred.hlsl",
+        "vsGeometryPass",
+        "geometry_pass.vs.cso",
+        "vs",
+        "PSO__GEOMETRY_PASS",
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "src/hlsl/deferred.hlsl",
+        "psGeometryPass",
+        "geometry_pass.ps.cso",
+        "ps",
+        "PSO__GEOMETRY_PASS",
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "src/hlsl/deferred.hlsl",
         "vsDebugView",
         "debug_view.vs.cso",
         "vs",
