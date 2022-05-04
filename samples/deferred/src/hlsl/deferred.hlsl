@@ -129,14 +129,14 @@ void psGeometryPass(
 
     float3 albedo = material.base_color;
     if (material.base_color_tex_index < 0xffffffff) {
-        Texture2D base_color_texture = ResourceDescriptorHeap[NonUniformResourceIndex(material.base_color_tex_index)];
+        Texture2D base_color_texture = ResourceDescriptorHeap[material.base_color_tex_index];
         albedo *= base_color_texture.Sample(sam_aniso, uvs).rgb;
     }
     gbuffer0 = float4(albedo, 1.0);
 
     float3 n = float3(0.0, 1.0, 0.0);
     if (material.normal_tex_index < 0xffffffff) {
-        Texture2D normal_texture = ResourceDescriptorHeap[NonUniformResourceIndex(material.normal_tex_index)];
+        Texture2D normal_texture = ResourceDescriptorHeap[material.normal_tex_index];
         n = normalize(normal_texture.Sample(sam_aniso, uvs).rgb * 2.0 - 1.0);
     }
 
@@ -153,7 +153,7 @@ void psGeometryPass(
     float metallic = 0.0;
     float roughness = 0.5;
     if (material.metallic_roughness_tex_index < 0xffffffff) {
-        Texture2D metallic_roughness_texture = ResourceDescriptorHeap[NonUniformResourceIndex(material.metallic_roughness_tex_index)];
+        Texture2D metallic_roughness_texture = ResourceDescriptorHeap[material.metallic_roughness_tex_index];
         const float2 mr = metallic_roughness_texture.Sample(sam_aniso, uvs).bg;
         metallic = mr.r;
         roughness = mr.g;

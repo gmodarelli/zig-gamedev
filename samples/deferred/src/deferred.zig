@@ -258,6 +258,8 @@ const DeferredSample = struct {
         const rt1 = createRenderTarget(&gctx, .R10G10B10A2_UNORM, &.{ 0.0, 1.0, 0.0, 1.0 });
         const rt2 = createRenderTarget(&gctx, .R8G8B8A8_UNORM, &.{ 0.0, 0.5, 0.0, 1.0 });
 
+        var mipgen_rgba8 = zd3d12.MipmapGenerator.init(arena_allocator, &gctx, .R8G8B8A8_UNORM, content_dir);
+
         gctx.beginFrame();
 
         var guir = GuiRenderer.init(arena_allocator, &gctx, 1, content_dir);
@@ -428,7 +430,7 @@ const DeferredSample = struct {
                     const view = gctx.allocatePersistentGpuDescriptors(1);
                     gctx.device.CreateShaderResourceView(gctx.lookupResource(resource).?, null, view.cpu_handle);
 
-                    // TODO: Generate mipmaps
+                    mipgen_rgba8.generateMipmaps(&gctx, resource);
                     gctx.addTransitionBarrier(resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                     const texture = Texture{
                         .resource = resource,
@@ -540,6 +542,7 @@ const DeferredSample = struct {
         gctx.endFrame();
         gctx.finishGpuCommands();
 
+        mipgen_rgba8.deinit(&gctx);
         _ = zpix.endCapture();
 
         return DeferredSample{
