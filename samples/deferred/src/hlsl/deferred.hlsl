@@ -161,16 +161,43 @@ void psGeometryPass(
     gbuffer2 = float4(metallic, roughness, 0.0, 1.0);
 }
 
+#elif defined(PSO__DEFERRED_COMPUTE_SHADING)
+
+#define root_signature \
+    "RootConstants(b0, num32BitConstants = 1), " \
+    "DescriptorTable(SRV(t0, numDescriptors = 3), UAV(u0, numDescriptors = 1))"
+
+struct Const {
+    uint padding;
+};
+
+ConstantBuffer<Const> cbv_const : register(b0);
+
+Texture2D<float4> gbuffer0 : register(t0);
+Texture2D<float4> gbuffer1 : register(t1);
+Texture2D<float4> gbuffer2 : register(t2);
+RWTexture2D<float4> output : register(u0);
+
+[RootSignature(root_signature)]
+[numthreads(16, 16, 1)]
+void csDeferredShading(uint3 dispatch_id : SV_DispatchThreadID) {
+    float3 albedo = gbuffer0.Load(uint3(dispatch_id.xy, 0)).rgb;
+    albedo = (albedo.r + albedo.g + albedo.g) / 3.0;
+    output[dispatch_id.xy] = float4(albedo, 1.0);
+}
+
 #elif defined(PSO__DEBUG_VIEW)
 
 #define root_signature \
     "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), " \
-    "RootConstants(b0, num32BitConstants = 1), " \
+    "RootConstants(b0, num32BitConstants = 3), " \
     "DescriptorTable(SRV(t0, numDescriptors = 4), visibility = SHADER_VISIBILITY_PIXEL), " \
     "StaticSampler(s0, filter = FILTER_ANISOTROPIC, maxAnisotropy = 16, visibility = SHADER_VISIBILITY_PIXEL)"
 
 struct DrawRootConst {
     int view_mode;
+    float znear;
+    float zfar;
 };
 
 ConstantBuffer<DrawRootConst> cbv_draw_root : register(b0);
@@ -200,7 +227,8 @@ void psDebugView(
         out_color = float4(uvs, 0.0, 1.0);
     } else if (cbv_draw_root.view_mode == 1) {
         float depth = srv_z_texture.Sample(sam_aniso, uvs).r;
-        out_color = float4(depth, depth, depth, 1.0) ;
+        float linear_depth = (depth - cbv_draw_root.znear) / (cbv_draw_root.zfar - cbv_draw_root.znear);
+        out_color = float4(depth.xxx, 1.0) ;
     } else if (cbv_draw_root.view_mode == 2) {
         float3 albedo = srv_gbuffer0.Sample(sam_aniso, uvs).rgb;
         out_color = float4(albedo, 1.0) ;

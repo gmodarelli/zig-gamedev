@@ -121,6 +121,15 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
 
     dxc_command = makeDxcCmd(
         "src/hlsl/deferred.hlsl",
+        "csDeferredShading",
+        "deferred_shading.cs.cso",
+        "cs",
+        "PSO__DEFERRED_COMPUTE_SHADING",
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "src/hlsl/deferred.hlsl",
         "vsDebugView",
         "debug_view.vs.cso",
         "vs",

@@ -94,6 +94,7 @@ const RenderTarget = struct {
     resource: zd3d12.ResourceHandle,
     rtv: d3d12.CPU_DESCRIPTOR_HANDLE,
     srv: d3d12.CPU_DESCRIPTOR_HANDLE,
+    uav: d3d12.CPU_DESCRIPTOR_HANDLE,
 };
 
 const DeferredSample = struct {
@@ -114,10 +115,13 @@ const DeferredSample = struct {
     rt0: RenderTarget,
     rt1: RenderTarget,
     rt2: RenderTarget,
+    // HDR Output Render Target
+    rt_hdr: RenderTarget,
 
     // PSOs
     z_pre_pass_pso: zd3d12.PipelineHandle,
     geometry_pass_pso: zd3d12.PipelineHandle,
+    compute_shading_pso: zd3d12.PipelineHandle,
     debug_view_pso: zd3d12.PipelineHandle,
 
     // Geometry Data
@@ -139,6 +143,8 @@ const DeferredSample = struct {
         forward: Vec3,
         pitch: f32,
         yaw: f32,
+        znear: f32,
+        zfar: f32,
     },
     mouse: struct {
         cursor_prev_x: i32,
@@ -202,6 +208,17 @@ const DeferredSample = struct {
             );
         };
 
+        // Compute Deferred Shading
+        const compute_shading_pso = blk: {
+            var pso_desc = d3d12.COMPUTE_PIPELINE_STATE_DESC.initDefault();
+
+            break :blk gctx.createComputeShaderPipeline(
+                arena_allocator,
+                &pso_desc,
+                content_dir ++ "shaders/deferred_shading.cs.cso",
+            );
+        };
+
         // Debug View PSO
         const debug_view_pso = blk: {
             // NOTE: This causes a warning because we're not binding a depth buffer.
@@ -254,9 +271,10 @@ const DeferredSample = struct {
         }, depth_texture_srv);
 
         // Create Geometry Pass render targets
-        const rt0 = createRenderTarget(&gctx, .R10G10B10A2_UNORM, &.{ 0.0, 0.0, 0.0, 1.0 });
-        const rt1 = createRenderTarget(&gctx, .R10G10B10A2_UNORM, &.{ 0.0, 1.0, 0.0, 1.0 });
-        const rt2 = createRenderTarget(&gctx, .R8G8B8A8_UNORM, &.{ 0.0, 0.5, 0.0, 1.0 });
+        const rt0 = createRenderTarget(&gctx, .R10G10B10A2_UNORM, &[4]f32{ 0.0, 0.0, 0.0, 1.0 }, true, false);
+        const rt1 = createRenderTarget(&gctx, .R10G10B10A2_UNORM, &[4]f32{ 0.0, 1.0, 0.0, 1.0 }, true, false);
+        const rt2 = createRenderTarget(&gctx, .R8G8B8A8_UNORM, &[4]f32{ 0.0, 0.5, 0.0, 1.0 }, true, false);
+        const rt_hdr = createRenderTarget(&gctx, .R16G16B16A16_FLOAT, &[4]f32{ 0.0, 0.0, 0.0, 1.0 }, false, true);
 
         var mipgen_rgba8 = zd3d12.MipmapGenerator.init(arena_allocator, &gctx, .R8G8B8A8_UNORM, content_dir);
 
@@ -557,9 +575,11 @@ const DeferredSample = struct {
             .rt0 = rt0,
             .rt1 = rt1,
             .rt2 = rt2,
+            .rt_hdr = rt_hdr,
 
             .z_pre_pass_pso = z_pre_pass_pso,
             .geometry_pass_pso = geometry_pass_pso,
+            .compute_shading_pso = compute_shading_pso,
             .debug_view_pso = debug_view_pso,
 
             .meshes = geometry.meshes,
@@ -572,13 +592,15 @@ const DeferredSample = struct {
             .index_buffer = geometry.index_buffer,
             .material_buffer = geometry.material_buffer,
 
-            .view_mode = 0,
+            .view_mode = 2,
 
             .camera = .{
                 .position = Vec3.init(0.0, 1.0, 0.0),
                 .forward = Vec3.initZero(),
                 .pitch = 0.0,
                 .yaw = math.pi + 0.25 * math.pi,
+                .znear = 0.1,
+                .zfar = 50.0,
             },
             .mouse = .{
                 .cursor_prev_x = 0,
@@ -606,7 +628,7 @@ const DeferredSample = struct {
         common.newImGuiFrame(sample.frame_stats.delta_time);
 
         _ = c.igBegin("Demo Settings", null, 0);
-        _ = c.igRadioButton_IntPtr("Default", &sample.view_mode, 0);
+        _ = c.igRadioButton_IntPtr("Lit", &sample.view_mode, 0);
         _ = c.igRadioButton_IntPtr("Depth", &sample.view_mode, 1);
         _ = c.igRadioButton_IntPtr("Albedo", &sample.view_mode, 2);
         _ = c.igRadioButton_IntPtr("World Space Normals", &sample.view_mode, 3);
@@ -678,8 +700,8 @@ const DeferredSample = struct {
         const cam_view_to_clip = vm.Mat4.initPerspectiveFovLh(
             math.pi / 3.0,
             @intToFloat(f32, gctx.viewport_width) / @intToFloat(f32, gctx.viewport_height),
-            0.1,
-            50.0,
+            sample.camera.znear,
+            sample.camera.zfar,
         );
         const cam_world_to_clip = cam_world_to_view.mul(cam_view_to_clip);
 
@@ -789,8 +811,31 @@ const DeferredSample = struct {
             }
         }
 
-        const back_buffer = gctx.getBackBuffer();
+        // Compute Deferred Shading
+        {
+            zpix.beginEvent(gctx.cmdlist, "Deferred Shading");
+            defer zpix.endEvent(gctx.cmdlist);
 
+            // Transition render targets to texurte attachments
+            gctx.addTransitionBarrier(sample.rt0.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(sample.rt1.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(sample.rt2.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.flushResourceBarriers();
+
+            gctx.setCurrentPipeline(sample.compute_shading_pso);
+            gctx.cmdlist.SetComputeRoot32BitConstant(0, 0, 0);
+            gctx.cmdlist.SetComputeRootDescriptorTable(1, blk: {
+                const table = gctx.copyDescriptorsToGpuHeap(1, sample.rt0.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt1.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt2.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt_hdr.uav);
+                break :blk table;
+            });
+
+            gctx.cmdlist.Dispatch(gctx.viewport_width / 16, gctx.viewport_height / 16, 1);
+        }
+
+        const back_buffer = gctx.getBackBuffer();
         // Debug View
         {
             zpix.beginEvent(gctx.cmdlist, "Debug View");
@@ -822,13 +867,12 @@ const DeferredSample = struct {
             gctx.setCurrentPipeline(sample.debug_view_pso);
             gctx.cmdlist.SetGraphicsRoot32BitConstants(
                 0,
-                1,
-                &[_]i32{sample.view_mode},
+                3,
+                &.{ sample.view_mode, sample.camera.znear, sample.camera.zfar },
                 0,
             );
             gctx.cmdlist.SetGraphicsRootDescriptorTable(1, blk: {
                 const table = gctx.copyDescriptorsToGpuHeap(1, sample.depth_texture_srv);
-                // TODO: Add other GBuffer textures
                 _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt0.srv);
                 _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt1.srv);
                 _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt2.srv);
@@ -893,7 +937,14 @@ const DeferredSample = struct {
         gctx: *zd3d12.GraphicsContext,
         format: dxgi.FORMAT,
         clear_value: *const [4]f32,
+        create_srv: bool,
+        create_uav: bool,
     ) RenderTarget {
+        var flags: d3d12.RESOURCE_FLAGS = d3d12.RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (create_uav) {
+            flags |= d3d12.RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        }
+
         const resource = gctx.createCommittedResource(
             .DEFAULT,
             d3d12.HEAP_FLAG_NONE,
@@ -904,7 +955,7 @@ const DeferredSample = struct {
                     gctx.viewport_height,
                     1,
                 );
-                desc.Flags = d3d12.RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+                desc.Flags = flags;
                 break :blk desc;
             },
             d3d12.RESOURCE_STATE_RENDER_TARGET,
@@ -912,23 +963,38 @@ const DeferredSample = struct {
         ) catch |err| hrPanic(err);
 
         const rt_rtv = gctx.allocateCpuDescriptors(.RTV, 1);
-        const rt_srv = gctx.allocateCpuDescriptors(.CBV_SRV_UAV, 1);
-
         gctx.device.CreateRenderTargetView(
             gctx.lookupResource(resource).?,
             null,
             rt_rtv,
         );
-        gctx.device.CreateShaderResourceView(
-            gctx.lookupResource(resource).?,
-            null,
-            rt_srv,
-        );
+
+        var rt_srv: d3d12.CPU_DESCRIPTOR_HANDLE = undefined;
+        if (create_srv) {
+            rt_srv = gctx.allocateCpuDescriptors(.CBV_SRV_UAV, 1);
+            gctx.device.CreateShaderResourceView(
+                gctx.lookupResource(resource).?,
+                null,
+                rt_srv,
+            );
+        }
+
+        var rt_uav: d3d12.CPU_DESCRIPTOR_HANDLE = undefined;
+        if (create_uav) {
+            rt_uav = gctx.allocateCpuDescriptors(.CBV_SRV_UAV, 1);
+            gctx.device.CreateUnorderedAccessView(
+                gctx.lookupResource(resource).?,
+                null,
+                null,
+                rt_uav,
+            );
+        }
 
         return RenderTarget{
             .resource = resource,
             .rtv = rt_rtv,
             .srv = rt_srv,
+            .uav = rt_uav,
         };
     }
 };
