@@ -18,12 +18,12 @@ const Vertex = struct {
 };
 
 const FrameUniforms = struct {
-    world_to_clip: [16]f32,
+    world_to_clip: zm.Mat,
     camera_position: [3]f32,
 };
 
 const DrawUniforms = struct {
-    object_to_world: [16]f32,
+    object_to_world: zm.Mat,
     basecolor_roughness: [4]f32,
 };
 
@@ -41,14 +41,13 @@ const Drawable = struct {
 };
 
 const DemoState = struct {
-    gctx: zgpu.GraphicsContext,
+    gctx: *zgpu.GraphicsContext,
 
     pipeline: zgpu.RenderPipelineHandle,
     bind_group: zgpu.BindGroupHandle,
 
     vertex_buffer: zgpu.BufferHandle,
     index_buffer: zgpu.BufferHandle,
-    uniform_buffer: zgpu.BufferHandle,
 
     depth_texture: zgpu.TextureHandle,
     depth_texture_view: zgpu.TextureViewHandle,
@@ -298,7 +297,7 @@ fn initScene(
 }
 
 fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
-    var gctx = try zgpu.GraphicsContext.init(allocator, window);
+    const gctx = try zgpu.GraphicsContext.init(allocator, window);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -370,14 +369,8 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
         break :pipeline gctx.createRenderPipeline(pipeline_descriptor);
     };
 
-    // Create an uniform buffer and a bind group for it.
-    const uniform_buffer = gctx.createBuffer(.{
-        .usage = .{ .copy_dst = true, .uniform = true },
-        .size = 64 * 1024,
-    });
-
     const bind_group = gctx.createBindGroup(bgl, &[_]zgpu.BindGroupEntryInfo{
-        .{ .binding = 0, .buffer_handle = uniform_buffer, .offset = 0, .size = 256 },
+        .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = 256 },
     });
 
     var drawables = std.ArrayList(Drawable).init(allocator);
@@ -416,7 +409,7 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
 
     // Create a depth texture and it's 'view'.
     const fb_size = try window.getFramebufferSize();
-    const depth = createDepthTexture(&gctx, fb_size.width, fb_size.height);
+    const depth = createDepthTexture(gctx, fb_size.width, fb_size.height);
 
     return DemoState{
         .gctx = gctx,
@@ -424,7 +417,6 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
         .bind_group = bind_group,
         .vertex_buffer = vertex_buffer,
         .index_buffer = index_buffer,
-        .uniform_buffer = uniform_buffer,
         .depth_texture = depth.texture,
         .depth_texture_view = depth.view,
         .meshes = meshes,
@@ -450,21 +442,26 @@ fn update(demo: *DemoState) void {
     const window = demo.gctx.window;
 
     c.igSetNextWindowPos(.{ .x = 10.0, .y = 10.0 }, c.ImGuiCond_FirstUseEver, .{ .x = 0.0, .y = 0.0 });
-    c.igSetNextWindowSize(.{ .x = 600.0, .y = -1 }, c.ImGuiCond_Always);
+    c.igSetNextWindowSize(.{ .x = 600.0, .y = 300 }, c.ImGuiCond_FirstUseEver);
     _ = c.igBegin(
         "Demo Settings",
         null,
-        c.ImGuiWindowFlags_NoMove | c.ImGuiWindowFlags_NoResize | c.ImGuiWindowFlags_NoSavedSettings,
+        c.ImGuiWindowFlags_None,
     );
+
     c.igBulletText("", "");
     c.igSameLine(0, -1);
-    c.igTextColored(.{ .x = 0, .y = 0.8, .z = 0, .w = 1 }, "Right Mouse Button + drag", "");
+    c.igPushStyleColor_Vec4(c.ImGuiCol_Text, .{ .x = 0, .y = 0.8, .z = 0, .w = 1 });
+    c.igText("Right Mouse Button + drag", "");
+    c.igPopStyleColor(1);
     c.igSameLine(0, -1);
     c.igText(" :  rotate camera", "");
 
     c.igBulletText("", "");
     c.igSameLine(0, -1);
-    c.igTextColored(.{ .x = 0, .y = 0.8, .z = 0, .w = 1 }, "W, A, S, D", "");
+    c.igPushStyleColor_Vec4(c.ImGuiCol_Text, .{ .x = 0, .y = 0.8, .z = 0, .w = 1 });
+    c.igText("W, A, S, D", "");
+    c.igPopStyleColor(1);
     c.igSameLine(0, -1);
     c.igText(" :  move camera", "");
 
@@ -517,7 +514,7 @@ fn update(demo: *DemoState) void {
 }
 
 fn draw(demo: *DemoState) void {
-    var gctx = &demo.gctx;
+    const gctx = demo.gctx;
     const fb_width = gctx.swapchain_descriptor.width;
     const fb_height = gctx.swapchain_descriptor.height;
 
@@ -540,37 +537,6 @@ fn draw(demo: *DemoState) void {
     const commands = commands: {
         const encoder = gctx.device.createCommandEncoder(null);
         defer encoder.release();
-
-        // Update camera xform.
-        {
-            var frame_uniforms: FrameUniforms = undefined;
-            zm.storeMat(frame_uniforms.world_to_clip[0..], zm.transpose(cam_world_to_clip));
-            frame_uniforms.camera_position = demo.camera.position;
-            encoder.writeBuffer(
-                gctx.lookupResource(demo.uniform_buffer).?,
-                0,
-                @TypeOf(frame_uniforms),
-                &.{frame_uniforms},
-            );
-        }
-
-        if (gctx.stats.frame_number == 0) {
-            for (demo.drawables.items) |drawable, drawable_index| {
-                const object_to_world = zm.translationV(
-                    zm.load(drawable.position[0..], zm.Vec, 3),
-                );
-                var draw_uniforms: DrawUniforms = undefined;
-                zm.storeMat(draw_uniforms.object_to_world[0..], zm.transpose(object_to_world));
-                draw_uniforms.basecolor_roughness = drawable.basecolor_roughness;
-
-                encoder.writeBuffer(
-                    gctx.lookupResource(demo.uniform_buffer).?,
-                    256 + 256 * drawable_index,
-                    @TypeOf(draw_uniforms),
-                    &.{draw_uniforms},
-                );
-            }
-        }
 
         // Main pass.
         pass: {
@@ -605,14 +571,27 @@ fn draw(demo: *DemoState) void {
             pass.setIndexBuffer(ib_info.gpuobj.?, .uint16, 0, ib_info.size);
 
             pass.setPipeline(pipeline);
-            pass.setBindGroup(0, bind_group, &.{0});
 
-            for (demo.drawables.items) |drawable, drawable_index| {
-                pass.setBindGroup(
-                    1,
-                    bind_group,
-                    &.{@intCast(u32, 256 + drawable_index * 256)},
-                );
+            // Update "world to clip" (camera) xform.
+            {
+                const mem = gctx.uniformsAllocate(FrameUniforms, 1);
+                mem.slice[0].world_to_clip = zm.transpose(cam_world_to_clip);
+                mem.slice[0].camera_position = demo.camera.position;
+
+                pass.setBindGroup(0, bind_group, &.{mem.offset});
+            }
+
+            for (demo.drawables.items) |drawable| {
+                // Update "object to world" xform.
+                const object_to_world = zm.translationV(zm.load(drawable.position[0..], zm.Vec, 3));
+
+                const mem = gctx.uniformsAllocate(DrawUniforms, 1);
+                mem.slice[0].object_to_world = zm.transpose(object_to_world);
+                mem.slice[0].basecolor_roughness = drawable.basecolor_roughness;
+
+                pass.setBindGroup(1, bind_group, &.{mem.offset});
+
+                // Draw.
                 pass.drawIndexed(
                     demo.meshes.items[drawable.mesh_index].num_indices,
                     1,
@@ -646,9 +625,7 @@ fn draw(demo: *DemoState) void {
     };
     defer commands.release();
 
-    gctx.queue.submit(&.{commands});
-
-    if (gctx.present() == .swap_chain_resized) {
+    if (gctx.submitAndPresent(&.{commands}) == .swap_chain_resized) {
         // Release old depth texture.
         gctx.destroyResource(demo.depth_texture_view);
         gctx.destroyResource(demo.depth_texture);
