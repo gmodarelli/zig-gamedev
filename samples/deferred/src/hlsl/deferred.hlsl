@@ -1,3 +1,5 @@
+#define PI 3.1415926
+
 #if defined(PSO__Z_PRE_PASS)
 
 #define root_signature \
@@ -189,6 +191,29 @@ Texture2D<float4> gbuffer1 : register(t2);
 Texture2D<float4> gbuffer2 : register(t3);
 RWTexture2D<float4> output : register(u0);
 
+float3 fresnelSchlick(float cos_theta, float3 f0) {
+    return saturate(f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0));
+}
+
+float distributionGgx(float3 n, float3 h, float roughness) {
+    float alpha = roughness * roughness;
+    float alpha_sq = alpha * alpha;
+    float n_dot_h = dot(n, h);
+    float n_dot_h_sq = n_dot_h * n_dot_h;
+    float k = n_dot_h_sq * alpha_sq + (1.0 - n_dot_h_sq);
+    return alpha_sq / (PI * k * k);
+}
+
+float geometrySchlickGgx(float cos_theta, float roughness) {
+    float k = (roughness * roughness) * 0.5;
+    return cos_theta / (cos_theta * (1.0 - k) + k);
+}
+
+// Geometry function returns probability [0.0, 1.0].
+float geometrySmith(float n_dot_l, float n_dot_v, float roughness) {
+    return saturate(geometrySchlickGgx(n_dot_v, roughness) * geometrySchlickGgx(n_dot_l, roughness));
+}
+
 [RootSignature(root_signature)]
 [numthreads(16, 16, 1)]
 void csDeferredShading(uint3 dispatch_id : SV_DispatchThreadID) {
@@ -203,8 +228,41 @@ void csDeferredShading(uint3 dispatch_id : SV_DispatchThreadID) {
     position_vs /= position_vs.w;
     float3 position_ws = mul(position_vs, cbv_scene_const.inverse_view).xyz;
 
-    float3 albedo = gbuffer0.Load(uint3(dispatch_id.xy, 0)).rgb;
-    output[dispatch_id.xy] = float4(position_ws, 1.0);
+    // Extract base color from Gbuffer
+    float3 base_color = gbuffer0.Load(uint3(dispatch_id.xy, 0)).rgb;
+    // Extract normal from Gbuffer
+    float3 n = gbuffer1.Load(uint3(dispatch_id.xy, 0)).xyz * 2.0 - 1.0;
+    // Extract metalness and roughness from Gbuffer
+    float2 data = gbuffer2.Load(uint3(dispatch_id.xy, 0)).rg;
+    float metalness = data.r;
+    float roughness = data.g;
+
+    const float3 v = normalize(cbv_scene_const.camera_position - position_ws);
+    const float n_dot_v = saturate(dot(n, v));
+
+    float3 f0 = float3(0.04, 0.04, 0.04);
+    f0 = lerp(f0, base_color, metalness);
+
+    float3 lo = 0.0;
+
+    // Light contribution
+    const float3 l_radiance = float3(70.0, 70.0, 50.0);
+    const float3 l = -normalize(cbv_scene_const.sun_light_direction);
+
+    float3 h = normalize(l + v);
+    float n_dot_l = saturate(dot(n, l));
+    float h_dot_v = saturate(dot(h, v));
+    float3 radiance = l_radiance;
+
+    float3 f = fresnelSchlick(h_dot_v, f0);
+    float nd = distributionGgx(n, h, roughness);
+    float g = geometrySmith(n_dot_l, n_dot_v, (roughness + 1.0) * 0.5);
+
+    float3 specular = (nd * g * f) / max(4.0 * n_dot_v * n_dot_l, 0.001);
+    float3 kd = (1.0 - f) * (1.0 - metalness);
+    lo += (kd * (base_color / PI) + specular) * radiance * n_dot_l;
+
+    output[dispatch_id.xy] = float4(lo, 1.0);
 }
 
 #elif defined(PSO__DEBUG_VIEW)
