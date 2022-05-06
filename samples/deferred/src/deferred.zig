@@ -63,6 +63,13 @@ const PsoGeometry_DrawConst = struct {
     material_index: u32,
 };
 
+const PsoDeferredShadingPass_SceneConst = struct {
+    inv_proj: Mat4,
+    inv_view: Mat4,
+    camera_position: Vec3,
+    sun_light_direction: Vec3,
+};
+
 const Mesh = struct {
     index_offset: u32,
     vertex_offset: u32,
@@ -150,7 +157,7 @@ const DeferredSample = struct {
         cursor_prev_x: i32,
         cursor_prev_y: i32,
     },
-    light_position: Vec3,
+    sun_light_direction: Vec3,
 
     pub fn init(allocator: std.mem.Allocator) !DeferredSample {
         const window = try common.initWindow(allocator, window_name, window_width, window_height);
@@ -606,7 +613,7 @@ const DeferredSample = struct {
                 .cursor_prev_x = 0,
                 .cursor_prev_y = 0,
             },
-            .light_position = Vec3.init(0.0, 5.0, 0.0),
+            .sun_light_direction = Vec3.init(0.0, -1.0, 0.0),
         };
     }
 
@@ -684,26 +691,30 @@ const DeferredSample = struct {
                 sample.camera.position = sample.camera.position.sub(up);
             }
         }
-
-        sample.light_position.c[0] = @floatCast(f32, 0.5 * @sin(0.25 * sample.frame_stats.time));
     }
 
     pub fn draw(sample: *DeferredSample) void {
         var gctx = &sample.gctx;
         gctx.beginFrame();
 
-        const cam_world_to_view = vm.Mat4.initLookToLh(
+        const view_matrix = vm.Mat4.initLookToLh(
             sample.camera.position,
             sample.camera.forward,
             vm.Vec3.init(0.0, 1.0, 0.0),
         );
-        const cam_view_to_clip = vm.Mat4.initPerspectiveFovLh(
+        const proj_matrix = vm.Mat4.initPerspectiveFovLh(
             math.pi / 3.0,
             @intToFloat(f32, gctx.viewport_width) / @intToFloat(f32, gctx.viewport_height),
             sample.camera.znear,
             sample.camera.zfar,
         );
-        const cam_world_to_clip = cam_world_to_view.mul(cam_view_to_clip);
+
+        var det: f32 = 0;
+        const inv_view_matrix = view_matrix.inv(&det);
+        const inv_proj_matrix = proj_matrix.inv(&det);
+        _ = det;
+
+        const cam_world_to_clip = view_matrix.mul(proj_matrix);
 
         // Z-PrePass
         {
@@ -816,6 +827,8 @@ const DeferredSample = struct {
             zpix.beginEvent(gctx.cmdlist, "Deferred Shading");
             defer zpix.endEvent(gctx.cmdlist);
 
+            // Transition the depth buffer from Depth attachment to "Texture" attachment
+            gctx.addTransitionBarrier(sample.depth_texture, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             // Transition render targets to texurte attachments
             gctx.addTransitionBarrier(sample.rt0.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             gctx.addTransitionBarrier(sample.rt1.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -823,9 +836,25 @@ const DeferredSample = struct {
             gctx.flushResourceBarriers();
 
             gctx.setCurrentPipeline(sample.compute_shading_pso);
-            gctx.cmdlist.SetComputeRoot32BitConstant(0, 0, 0);
-            gctx.cmdlist.SetComputeRootDescriptorTable(1, blk: {
-                const table = gctx.copyDescriptorsToGpuHeap(1, sample.rt0.srv);
+            gctx.cmdlist.SetComputeRoot32BitConstants(
+                0,
+                3, 
+                &.{ gctx.viewport_width, gctx.viewport_height },
+                0,
+            );
+
+            // Set scene constants
+            const scene_const_mem = gctx.allocateUploadMemory(PsoDeferredShadingPass_SceneConst, 1);
+            scene_const_mem.cpu_slice[0] = .{
+                .inv_proj = inv_proj_matrix.transpose(),
+                .inv_view = inv_view_matrix.transpose(),
+                .camera_position = sample.camera.position,
+                .sun_light_direction = sample.sun_light_direction,
+            };
+            gctx.cmdlist.SetComputeRootConstantBufferView(1, scene_const_mem.gpu_base);
+            gctx.cmdlist.SetComputeRootDescriptorTable(2, blk: {
+                const table = gctx.copyDescriptorsToGpuHeap(1, sample.depth_texture_srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt0.srv);
                 _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt1.srv);
                 _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt2.srv);
                 _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt_hdr.uav);

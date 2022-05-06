@@ -164,26 +164,47 @@ void psGeometryPass(
 #elif defined(PSO__DEFERRED_COMPUTE_SHADING)
 
 #define root_signature \
-    "RootConstants(b0, num32BitConstants = 1), " \
-    "DescriptorTable(SRV(t0, numDescriptors = 3), UAV(u0, numDescriptors = 1))"
+    "RootConstants(b0, num32BitConstants = 2), " \
+    "CBV(b1), " \
+    "DescriptorTable(SRV(t0, numDescriptors = 4), UAV(u0, numDescriptors = 1))"
 
-struct Const {
-    uint padding;
+struct DrawRootConst {
+    uint screen_width;
+    uint screen_height;
 };
 
-ConstantBuffer<Const> cbv_const : register(b0);
+struct SceneConst {
+    float4x4 inverse_projection;
+    float4x4 inverse_view;
+    float3 camera_position;
+    float3 sun_light_direction;
+};
 
-Texture2D<float4> gbuffer0 : register(t0);
-Texture2D<float4> gbuffer1 : register(t1);
-Texture2D<float4> gbuffer2 : register(t2);
+ConstantBuffer<DrawRootConst> cbv_root_const : register(b0);
+ConstantBuffer<SceneConst> cbv_scene_const : register(b1);
+
+Texture2D<float4> depth_texture : register(t0);
+Texture2D<float4> gbuffer0 : register(t1);
+Texture2D<float4> gbuffer1 : register(t2);
+Texture2D<float4> gbuffer2 : register(t3);
 RWTexture2D<float4> output : register(u0);
 
 [RootSignature(root_signature)]
 [numthreads(16, 16, 1)]
 void csDeferredShading(uint3 dispatch_id : SV_DispatchThreadID) {
+    float z = depth_texture.Load(uint3(dispatch_id.xy, 0)).r;
+    float4 position_cs = float4(
+        (dispatch_id.x / cbv_root_const.screen_width) * 2.0 - 1.0,
+        (dispatch_id.y / cbv_root_const.screen_height) * 2.0 - 1.0,
+        z,
+        1.0
+    );
+    float4 position_vs = mul(position_cs, cbv_scene_const.inverse_projection);
+    position_vs /= position_vs.w;
+    float3 position_ws = mul(position_vs, cbv_scene_const.inverse_view).xyz;
+
     float3 albedo = gbuffer0.Load(uint3(dispatch_id.xy, 0)).rgb;
-    albedo = (albedo.r + albedo.g + albedo.g) / 3.0;
-    output[dispatch_id.xy] = float4(albedo, 1.0);
+    output[dispatch_id.xy] = float4(position_ws, 1.0);
 }
 
 #elif defined(PSO__DEBUG_VIEW)
@@ -201,7 +222,7 @@ struct DrawRootConst {
 };
 
 ConstantBuffer<DrawRootConst> cbv_draw_root : register(b0);
-Texture2D srv_z_texture : register(t0);
+Texture2D srv_depth_texture : register(t0);
 Texture2D srv_gbuffer0 : register(t1);
 Texture2D srv_gbuffer1 : register(t2);
 Texture2D srv_gbuffer2 : register(t3);
@@ -226,7 +247,7 @@ void psDebugView(
     if (cbv_draw_root.view_mode == 0) {
         out_color = float4(uvs, 0.0, 1.0);
     } else if (cbv_draw_root.view_mode == 1) {
-        float depth = srv_z_texture.Sample(sam_aniso, uvs).r;
+        float depth = srv_depth_texture.Sample(sam_aniso, uvs).r;
         float linear_depth = (depth - cbv_draw_root.znear) / (cbv_draw_root.zfar - cbv_draw_root.znear);
         out_color = float4(depth.xxx, 1.0) ;
     } else if (cbv_draw_root.view_mode == 2) {
