@@ -1,38 +1,61 @@
+#define GAMMA 2.2
 #define PI 3.1415926
 
-#if defined(PSO__Z_PRE_PASS)
+struct Material {
+    float3 base_color;
+    float roughness;
+
+    float metallic;
+    uint base_color_tex_index;
+    uint metallic_roughness_tex_index;
+    uint normal_tex_index;
+
+    float alpha_cutoff;
+    float3 _padding;
+};
+
+#if defined(PSO__Z_PRE_PASS) || defined(PSO__Z_PRE_PASS_ALPHA_TESTED)
 
 #define root_signature \
     "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), " \
     "RootConstants(b0, num32BitConstants = 2), " \
     "CBV(b1), " \
-    "CBV(b2)"
+    "CBV(b2), " \
+    "StaticSampler(s0, filter = FILTER_ANISOTROPIC, maxAnisotropy = 16, visibility = SHADER_VISIBILITY_PIXEL)"
 
 struct DrawRootConst {
     uint vertex_offset;
     uint index_offset;
 };
 
+// TODO: Consider unifying this across all pipelines
 struct SceneConst {
     float4x4 world_to_clip;
     uint position_buffer_index;
     uint index_buffer_index;
+    uint texcoord_buffer_index;
+    uint material_buffer_index;
 };
 
+// TODO: Consider unifying this across all pipelines
 struct DrawConst {
     float4x4 object_to_world;
+    uint material_index;
 };
 
 ConstantBuffer<DrawRootConst> cbv_draw_root : register(b0);
 ConstantBuffer<SceneConst> cbv_scene_const : register(b1);
 ConstantBuffer<DrawConst> cbv_draw_const : register(b2);
+SamplerState sam_aniso : register(s0);
 
 [RootSignature(root_signature)]
 void vsZPrePass(
     uint vertex_id : SV_VertexID,
-    out float4 out_position_clip : SV_Position
+    out float4 out_position_clip : SV_Position,
+    out float2 out_uv: TEXCOORD0
 ) {
     StructuredBuffer<float3> srv_position_buffer = ResourceDescriptorHeap[cbv_scene_const.position_buffer_index];
+    StructuredBuffer<float2> srv_texcoord_buffer = ResourceDescriptorHeap[cbv_scene_const.texcoord_buffer_index];
     Buffer<uint> srv_index_buffer = ResourceDescriptorHeap[cbv_scene_const.index_buffer_index];
 
     const uint vertex_index = srv_index_buffer[vertex_id + cbv_draw_root.index_offset] + cbv_draw_root.vertex_offset;
@@ -40,15 +63,27 @@ void vsZPrePass(
 
     const float4x4 object_to_clip = mul(cbv_draw_const.object_to_world, cbv_scene_const.world_to_clip);
     out_position_clip = mul(float4(position_os, 1.0), object_to_clip);
+    out_uv = srv_texcoord_buffer[vertex_index];
 }
 
 [RootSignature(root_signature)]
 void psZPrePass(
-    float4 position_window : SV_Position
+    float4 position_window : SV_Position,
+    float2 uvs : TEXCOORD0
 ) {
+#if defined(PSO__Z_PRE_PASS_ALPHA_TESTED)
+    StructuredBuffer<Material> srv_material_buffer = ResourceDescriptorHeap[cbv_scene_const.material_buffer_index];
+    Material material = srv_material_buffer[cbv_draw_const.material_index];
+
+    if (material.base_color_tex_index < 0xffffffff) {
+        Texture2D base_color_texture = ResourceDescriptorHeap[material.base_color_tex_index];
+        float alpha = base_color_texture.Sample(sam_aniso, uvs).a;
+        clip(alpha - material.alpha_cutoff);
+    }
+#endif
 }
 
-#elif defined(PSO__GEOMETRY_PASS)
+#elif defined(PSO__GEOMETRY_PASS) || defined(PSO__GEOMETRY_PASS_ALPHA_TESTED)
 
 #define root_signature \
     "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), " \
@@ -75,15 +110,6 @@ struct SceneConst {
 struct DrawConst {
     float4x4 object_to_world;
     uint material_index;
-};
-
-struct Material {
-    float3 base_color;
-    float roughness;
-    float metallic;
-    uint base_color_tex_index;
-    uint metallic_roughness_tex_index;
-    uint normal_tex_index;
 };
 
 ConstantBuffer<DrawRootConst> cbv_draw_root : register(b0);
@@ -132,7 +158,12 @@ void psGeometryPass(
     float3 albedo = material.base_color;
     if (material.base_color_tex_index < 0xffffffff) {
         Texture2D base_color_texture = ResourceDescriptorHeap[material.base_color_tex_index];
-        albedo *= base_color_texture.Sample(sam_aniso, uvs).rgb;
+        float4 base_color = base_color_texture.Sample(sam_aniso, uvs);
+
+#if defined(PSO__GEOMETRY_PASS_ALPHA_TESTED)
+        clip(base_color.a - material.alpha_cutoff);
+#endif
+        albedo *= pow(base_color.rgb, GAMMA);
     }
     gbuffer0 = float4(albedo, 1.0);
 
@@ -175,11 +206,19 @@ struct DrawRootConst {
     uint screen_height;
 };
 
+struct Light {
+    float4 position_ws;     // position for point lights, direction for directional lights
+    float4 radiance;        // xyz: radiance. w: intensity
+    float radius;           // only used for point lights
+    uint type;              // 0: directional, 1: point
+    float2 _padding;
+};
+
 struct SceneConst {
     float4x4 inverse_projection;
     float4x4 inverse_view;
     float3 camera_position;
-    float3 sun_light_direction;
+    float padding;
 };
 
 ConstantBuffer<DrawRootConst> cbv_root_const : register(b0);
@@ -247,7 +286,7 @@ void csDeferredShading(uint3 dispatch_id : SV_DispatchThreadID) {
 
     // Light contribution
     const float3 l_radiance = float3(70.0, 70.0, 50.0);
-    const float3 l = -normalize(cbv_scene_const.sun_light_direction);
+    const float3 l = float3(0.0, -1.0, 0.0);
 
     float3 h = normalize(l + v);
     float n_dot_l = saturate(dot(n, l));

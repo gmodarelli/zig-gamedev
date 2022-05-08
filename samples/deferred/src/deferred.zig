@@ -37,10 +37,13 @@ const PsoZPrePass_SceneConst = struct {
     world_to_clip: Mat4,
     position_buffer_index: u32,
     index_buffer_index: u32,
+    texcoord_buffer_index: u32,
+    material_buffer_index: u32,
 };
 
 const PsoZPrePass_DrawConst = struct {
     object_to_world: Mat4,
+    material_index: u32,
 };
 
 const PsoGeometry_DrawRootConst = struct {
@@ -67,7 +70,6 @@ const PsoDeferredShadingPass_SceneConst = struct {
     inv_proj: Mat4,
     inv_view: Mat4,
     camera_position: Vec3,
-    sun_light_direction: Vec3,
 };
 
 const Mesh = struct {
@@ -78,13 +80,26 @@ const Mesh = struct {
     material_index: u32,
 };
 
+// pub const AlphaMode = enum(u8) {
+//     opaque = 0,
+//     mask = 1,
+//     blend = 2,
+// };
+
 const Material = struct {
     base_color: Vec3,
     roughness: f32,
+
     metallic: f32,
     base_color_tex_index: u32,
     metallic_roughness_tex_index: u32,
     normal_tex_index: u32,
+
+    alpha_cutoff: f32,
+    double_sided: bool,
+    alpha_mode: u8,
+    _padding0: u16,
+    _padding1: [2]u32,
 };
 
 const Texture = struct {
@@ -126,8 +141,10 @@ const DeferredSample = struct {
     rt_hdr: RenderTarget,
 
     // PSOs
-    z_pre_pass_pso: zd3d12.PipelineHandle,
-    geometry_pass_pso: zd3d12.PipelineHandle,
+    z_pre_pass_opaque_pso: zd3d12.PipelineHandle,
+    z_pre_pass_alpha_tested_pso: zd3d12.PipelineHandle,
+    geometry_pass_opaque_pso: zd3d12.PipelineHandle,
+    geometry_pass_alpha_tested_pso: zd3d12.PipelineHandle,
     compute_shading_pso: zd3d12.PipelineHandle,
     debug_view_pso: zd3d12.PipelineHandle,
 
@@ -142,6 +159,9 @@ const DeferredSample = struct {
     meshes: std.ArrayList(Mesh),
     materials: std.ArrayList(Material),
     textures: std.ArrayList(Texture),
+    
+    alpha_tested_mesh_indices: std.ArrayList(u32),
+    opaque_mesh_indices: std.ArrayList(u32),
 
     view_mode: i32,
 
@@ -157,7 +177,6 @@ const DeferredSample = struct {
         cursor_prev_x: i32,
         cursor_prev_y: i32,
     },
-    sun_light_direction: Vec3,
 
     pub fn init(allocator: std.mem.Allocator) !DeferredSample {
         const window = try common.initWindow(allocator, window_name, window_width, window_height);
@@ -177,7 +196,7 @@ const DeferredSample = struct {
 
         // Initialize PSOs
         // Z-PrePass
-        const z_pre_pass_pso = blk: {
+        const z_pre_pass_psos = blk: {
             var pso_desc = d3d12.GRAPHICS_PIPELINE_STATE_DESC.initDefault();
             pso_desc.RTVFormats[0] = .UNKNOWN;
             pso_desc.NumRenderTargets = 0;
@@ -185,16 +204,30 @@ const DeferredSample = struct {
             pso_desc.DSVFormat = .D32_FLOAT;
             pso_desc.PrimitiveTopologyType = .TRIANGLE;
 
-            break :blk gctx.createGraphicsShaderPipeline(
+            const opaque_pso = gctx.createGraphicsShaderPipeline(
                 arena_allocator,
                 &pso_desc,
                 content_dir ++ "shaders/z_pre_pass.vs.cso",
-                content_dir ++ "shaders/z_pre_pass.ps.cso",
+                content_dir ++ "shaders/z_pre_pass_opaque.ps.cso",
             );
+
+            pso_desc.RasterizerState.CullMode = .NONE;
+
+            const alpha_tested_pso = gctx.createGraphicsShaderPipeline(
+                arena_allocator,
+                &pso_desc,
+                content_dir ++ "shaders/z_pre_pass.vs.cso",
+                content_dir ++ "shaders/z_pre_pass_alpha_tested.ps.cso",
+            );
+
+            break :blk .{
+                .opaque_pso = opaque_pso,
+                .alpha_tested_pso = alpha_tested_pso
+            };
         };
 
         // Geometry Pass
-        const geometry_pass_pso = blk: {
+        const geometry_pass_psos = blk: {
             var pso_desc = d3d12.GRAPHICS_PIPELINE_STATE_DESC.initDefault();
             pso_desc.NumRenderTargets = 3;
             pso_desc.RTVFormats[0] = .R10G10B10A2_UNORM;
@@ -207,12 +240,26 @@ const DeferredSample = struct {
             pso_desc.DepthStencilState.DepthFunc = .LESS_EQUAL;
             pso_desc.PrimitiveTopologyType = .TRIANGLE;
 
-            break :blk gctx.createGraphicsShaderPipeline(
+            const opaque_pso = gctx.createGraphicsShaderPipeline(
                 arena_allocator,
                 &pso_desc,
                 content_dir ++ "shaders/geometry_pass.vs.cso",
-                content_dir ++ "shaders/geometry_pass.ps.cso",
+                content_dir ++ "shaders/geometry_pass_opaque.ps.cso",
             );
+
+            pso_desc.RasterizerState.CullMode = .NONE;
+
+            const alpha_tested_pso = gctx.createGraphicsShaderPipeline(
+                arena_allocator,
+                &pso_desc,
+                content_dir ++ "shaders/geometry_pass.vs.cso",
+                content_dir ++ "shaders/geometry_pass_alpha_tested.ps.cso",
+            );
+
+            break :blk .{
+                .opaque_pso = opaque_pso,
+                .alpha_tested_pso = alpha_tested_pso
+            };
         };
 
         // Compute Deferred Shading
@@ -483,6 +530,15 @@ const DeferredSample = struct {
 
                     const mr = &gltf_material.pbr_metallic_roughness;
 
+                    const alpha_cutoff: f32 = gltf_material.alpha_cutoff;
+                    const double_sided: bool = if(gltf_material.double_sided == 1) true else false;
+                    const alpha_mode: u8 = switch(gltf_material.alpha_mode) {
+                        c.cgltf_alpha_mode_opaque => 0,
+                        c.cgltf_alpha_mode_mask => 1,
+                        c.cgltf_alpha_mode_blend => 2,
+                        else => 0,
+                    };
+
                     const num_images = @intCast(u32, data.images_count);
                     const invalid_image_index = num_images;
 
@@ -533,7 +589,27 @@ const DeferredSample = struct {
                         .base_color_tex_index = base_color_tex_index,
                         .metallic_roughness_tex_index = metallic_roughness_tex_index,
                         .normal_tex_index = normal_tex_index,
+                        .alpha_cutoff = alpha_cutoff,
+                        .double_sided = double_sided,
+                        .alpha_mode = alpha_mode,
+                        ._padding0 = 0,
+                        ._padding1 = [2]u32{ 0, 0 },
                     });
+                }
+            }
+
+            // Split meshes into AlphaTested and Opaques
+            var alpha_tested_mesh_indices = std.ArrayList(u32).init(allocator);
+            var opaque_mesh_indices = std.ArrayList(u32).init(allocator);
+            {
+                var i: u32 = 0;
+                while (i < meshes.items.len) : (i += 1) {
+                    var material = &materials.items[meshes.items[i].material_index];
+                    if (material.double_sided) {
+                        alpha_tested_mesh_indices.append(i) catch unreachable;
+                    } else {
+                        opaque_mesh_indices.append(i) catch unreachable;
+                    }
                 }
             }
 
@@ -555,6 +631,8 @@ const DeferredSample = struct {
                 .meshes = meshes,
                 .materials = materials,
                 .textures = textures,
+                .alpha_tested_mesh_indices = alpha_tested_mesh_indices,
+                .opaque_mesh_indices = opaque_mesh_indices,
                 .position_buffer = position_buffer,
                 .normal_buffer = normal_buffer,
                 .texcoord_buffer = texcoord_buffer,
@@ -584,14 +662,18 @@ const DeferredSample = struct {
             .rt2 = rt2,
             .rt_hdr = rt_hdr,
 
-            .z_pre_pass_pso = z_pre_pass_pso,
-            .geometry_pass_pso = geometry_pass_pso,
+            .z_pre_pass_opaque_pso = z_pre_pass_psos.opaque_pso,
+            .z_pre_pass_alpha_tested_pso = z_pre_pass_psos.alpha_tested_pso,
+            .geometry_pass_opaque_pso = geometry_pass_psos.opaque_pso,
+            .geometry_pass_alpha_tested_pso = geometry_pass_psos.alpha_tested_pso,
             .compute_shading_pso = compute_shading_pso,
             .debug_view_pso = debug_view_pso,
 
             .meshes = geometry.meshes,
             .materials = geometry.materials,
             .textures = geometry.textures,
+            .alpha_tested_mesh_indices = geometry.alpha_tested_mesh_indices,
+            .opaque_mesh_indices = geometry.opaque_mesh_indices,
             .position_buffer = geometry.position_buffer,
             .normal_buffer = geometry.normal_buffer,
             .texcoord_buffer = geometry.texcoord_buffer,
@@ -613,7 +695,6 @@ const DeferredSample = struct {
                 .cursor_prev_x = 0,
                 .cursor_prev_y = 0,
             },
-            .sun_light_direction = Vec3.init(0.0, -1.0, 0.0),
         };
     }
 
@@ -626,6 +707,8 @@ const DeferredSample = struct {
         sample.meshes.deinit();
         sample.materials.deinit();
         sample.textures.deinit();
+        sample.alpha_tested_mesh_indices.deinit();
+        sample.opaque_mesh_indices.deinit();
         sample.* = undefined;
     }
 
@@ -737,20 +820,50 @@ const DeferredSample = struct {
                 .world_to_clip = cam_world_to_clip.transpose(),
                 .position_buffer_index = sample.position_buffer.persistent_descriptor.index,
                 .index_buffer_index = sample.index_buffer.persistent_descriptor.index,
+                .texcoord_buffer_index = sample.texcoord_buffer.persistent_descriptor.index,
+                .material_buffer_index = sample.material_buffer.persistent_descriptor.index,
             };
 
-            gctx.setCurrentPipeline(sample.z_pre_pass_pso);
-            gctx.cmdlist.SetGraphicsRootConstantBufferView(1, scene_const_mem.gpu_base);
+            {
+                gctx.setCurrentPipeline(sample.z_pre_pass_opaque_pso);
+                gctx.cmdlist.SetGraphicsRootConstantBufferView(1, scene_const_mem.gpu_base);
 
-            for (sample.meshes.items) |mesh| {
-                gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
-                // TODO: Replace this with a storage buffer?
-                const draw_const_mem = gctx.allocateUploadMemory(PsoZPrePass_DrawConst, 1);
-                draw_const_mem.cpu_slice[0] = .{
-                    .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
-                };
-                gctx.cmdlist.SetGraphicsRootConstantBufferView(2, draw_const_mem.gpu_base);
-                gctx.cmdlist.DrawInstanced(mesh.num_indices, 1, 0, 0);
+                zpix.beginEvent(gctx.cmdlist, "Opaque");
+                defer zpix.endEvent(gctx.cmdlist);
+
+                for (sample.opaque_mesh_indices.items) |mesh_index| {
+                    const mesh = &sample.meshes.items[mesh_index];
+                    gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
+                    // TODO: Replace this with a storage buffer?
+                    const draw_const_mem = gctx.allocateUploadMemory(PsoZPrePass_DrawConst, 1);
+                    draw_const_mem.cpu_slice[0] = .{
+                        .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
+                        .material_index = mesh.material_index,
+                    };
+                    gctx.cmdlist.SetGraphicsRootConstantBufferView(2, draw_const_mem.gpu_base);
+                    gctx.cmdlist.DrawInstanced(mesh.num_indices, 1, 0, 0);
+                }
+            }
+
+            {
+                gctx.setCurrentPipeline(sample.z_pre_pass_alpha_tested_pso);
+                gctx.cmdlist.SetGraphicsRootConstantBufferView(1, scene_const_mem.gpu_base);
+
+                zpix.beginEvent(gctx.cmdlist, "Alpha Tested");
+                defer zpix.endEvent(gctx.cmdlist);
+
+                for (sample.alpha_tested_mesh_indices.items) |mesh_index| {
+                    const mesh = &sample.meshes.items[mesh_index];
+                    gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
+                    // TODO: Replace this with a storage buffer?
+                    const draw_const_mem = gctx.allocateUploadMemory(PsoZPrePass_DrawConst, 1);
+                    draw_const_mem.cpu_slice[0] = .{
+                        .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
+                        .material_index = mesh.material_index,
+                    };
+                    gctx.cmdlist.SetGraphicsRootConstantBufferView(2, draw_const_mem.gpu_base);
+                    gctx.cmdlist.DrawInstanced(mesh.num_indices, 1, 0, 0);
+                }
             }
         }
 
@@ -806,19 +919,48 @@ const DeferredSample = struct {
                 .material_buffer_index = sample.material_buffer.persistent_descriptor.index,
             };
 
-            gctx.setCurrentPipeline(sample.geometry_pass_pso);
-            gctx.cmdlist.SetGraphicsRootConstantBufferView(1, scene_const_mem.gpu_base);
+            {
+                zpix.beginEvent(gctx.cmdlist, "Opaque");
+                defer zpix.endEvent(gctx.cmdlist);
 
-            for (sample.meshes.items) |mesh| {
-                gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
-                // TODO: Replace this with a storage buffer?
-                const draw_const_mem = gctx.allocateUploadMemory(PsoGeometry_DrawConst, 1);
-                draw_const_mem.cpu_slice[0] = .{
-                    .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
-                    .material_index = mesh.material_index,
-                };
-                gctx.cmdlist.SetGraphicsRootConstantBufferView(2, draw_const_mem.gpu_base);
-                gctx.cmdlist.DrawInstanced(mesh.num_indices, 1, 0, 0);
+                gctx.setCurrentPipeline(sample.geometry_pass_opaque_pso);
+                gctx.cmdlist.SetGraphicsRootConstantBufferView(1, scene_const_mem.gpu_base);
+
+                for (sample.opaque_mesh_indices.items) |mesh_index| {
+                    const mesh = &sample.meshes.items[mesh_index];
+
+                    gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
+                    // TODO: Replace this with a storage buffer?
+                    const draw_const_mem = gctx.allocateUploadMemory(PsoGeometry_DrawConst, 1);
+                    draw_const_mem.cpu_slice[0] = .{
+                        .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
+                        .material_index = mesh.material_index,
+                    };
+                    gctx.cmdlist.SetGraphicsRootConstantBufferView(2, draw_const_mem.gpu_base);
+                    gctx.cmdlist.DrawInstanced(mesh.num_indices, 1, 0, 0);
+                }
+            }
+
+            {
+                zpix.beginEvent(gctx.cmdlist, "Alpha Tested");
+                defer zpix.endEvent(gctx.cmdlist);
+
+                gctx.setCurrentPipeline(sample.geometry_pass_alpha_tested_pso);
+                gctx.cmdlist.SetGraphicsRootConstantBufferView(1, scene_const_mem.gpu_base);
+
+                for (sample.alpha_tested_mesh_indices.items) |mesh_index| {
+                    const mesh = &sample.meshes.items[mesh_index];
+
+                    gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
+                    // TODO: Replace this with a storage buffer?
+                    const draw_const_mem = gctx.allocateUploadMemory(PsoGeometry_DrawConst, 1);
+                    draw_const_mem.cpu_slice[0] = .{
+                        .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
+                        .material_index = mesh.material_index,
+                    };
+                    gctx.cmdlist.SetGraphicsRootConstantBufferView(2, draw_const_mem.gpu_base);
+                    gctx.cmdlist.DrawInstanced(mesh.num_indices, 1, 0, 0);
+                }
             }
         }
 
@@ -849,7 +991,6 @@ const DeferredSample = struct {
                 .inv_proj = inv_proj_matrix.transpose(),
                 .inv_view = inv_view_matrix.transpose(),
                 .camera_position = sample.camera.position,
-                .sun_light_direction = sample.sun_light_direction,
             };
             gctx.cmdlist.SetComputeRootConstantBufferView(1, scene_const_mem.gpu_base);
             gctx.cmdlist.SetComputeRootDescriptorTable(2, blk: {

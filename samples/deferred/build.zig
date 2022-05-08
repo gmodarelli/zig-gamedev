@@ -95,9 +95,18 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
     dxc_command = makeDxcCmd(
         "src/hlsl/deferred.hlsl",
         "psZPrePass",
-        "z_pre_pass.ps.cso",
+        "z_pre_pass_opaque.ps.cso",
         "ps",
         "PSO__Z_PRE_PASS",
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "src/hlsl/deferred.hlsl",
+        "psZPrePass",
+        "z_pre_pass_alpha_tested.ps.cso",
+        "ps",
+        "PSO__Z_PRE_PASS_ALPHA_TESTED",
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -113,9 +122,18 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
     dxc_command = makeDxcCmd(
         "src/hlsl/deferred.hlsl",
         "psGeometryPass",
-        "geometry_pass.ps.cso",
+        "geometry_pass_opaque.ps.cso",
         "ps",
         "PSO__GEOMETRY_PASS",
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "src/hlsl/deferred.hlsl",
+        "psGeometryPass",
+        "geometry_pass_alpha_tested.ps.cso",
+        "ps",
+        "PSO__GEOMETRY_PASS_ALPHA_TESTED",
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
