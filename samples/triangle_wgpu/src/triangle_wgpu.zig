@@ -145,8 +145,7 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
     gctx.queue.writeBuffer(gctx.lookupResource(index_buffer).?, 0, u32, index_data[0..]);
 
     // Create a depth texture and it's 'view'.
-    const fb_size = try window.getFramebufferSize();
-    const depth = createDepthTexture(gctx, fb_size.width, fb_size.height);
+    const depth = createDepthTexture(gctx);
 
     return DemoState{
         .gctx = gctx,
@@ -165,13 +164,7 @@ fn deinit(allocator: std.mem.Allocator, demo: *DemoState) void {
 }
 
 fn update(demo: *DemoState) void {
-    zgpu.gui.newFrame(
-        demo.gctx.window_width,
-        demo.gctx.window_height,
-        demo.gctx.swapchain_descriptor.width,
-        demo.gctx.swapchain_descriptor.height,
-    );
-
+    zgpu.gui.newFrame(demo.gctx.swapchain_descriptor.width, demo.gctx.swapchain_descriptor.height);
     c.igShowDemoWindow(null);
 }
 
@@ -286,24 +279,24 @@ fn draw(demo: *DemoState) void {
         gctx.destroyResource(demo.depth_texture);
 
         // Create a new depth texture to match the new window size.
-        const depth = createDepthTexture(
-            gctx,
-            gctx.swapchain_descriptor.width,
-            gctx.swapchain_descriptor.height,
-        );
+        const depth = createDepthTexture(gctx);
         demo.depth_texture = depth.texture;
         demo.depth_texture_view = depth.view;
     }
 }
 
-fn createDepthTexture(gctx: *zgpu.GraphicsContext, width: u32, height: u32) struct {
+fn createDepthTexture(gctx: *zgpu.GraphicsContext) struct {
     texture: zgpu.TextureHandle,
     view: zgpu.TextureViewHandle,
 } {
     const texture = gctx.createTexture(.{
         .usage = .{ .render_attachment = true },
         .dimension = .dimension_2d,
-        .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
+        .size = .{
+            .width = gctx.swapchain_descriptor.width,
+            .height = gctx.swapchain_descriptor.height,
+            .depth_or_array_layers = 1,
+        },
         .format = .depth32_float,
         .mip_level_count = 1,
         .sample_count = 1,

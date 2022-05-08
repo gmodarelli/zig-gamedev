@@ -23,8 +23,6 @@ pub const GraphicsContext = struct {
     device: gpu.Device,
     queue: gpu.Queue,
     window: glfw.Window,
-    window_width: u32,
-    window_height: u32,
     window_surface: gpu.Surface,
     swapchain: gpu.SwapChain,
     swapchain_descriptor: gpu.SwapChain.Descriptor,
@@ -108,7 +106,6 @@ pub const GraphicsContext = struct {
             window,
             comptime detectGLFWOptions(),
         );
-        const window_size = window.getSize() catch unreachable;
         const framebuffer_size = window.getFramebufferSize() catch unreachable;
 
         const swapchain_descriptor = gpu.SwapChain.Descriptor{
@@ -133,8 +130,6 @@ pub const GraphicsContext = struct {
             .device = device,
             .queue = device.getQueue(),
             .window = window,
-            .window_width = window_size.width,
-            .window_height = window_size.height,
             .window_surface = window_surface,
             .swapchain = swapchain,
             .swapchain_descriptor = swapchain_descriptor,
@@ -327,7 +322,6 @@ pub const GraphicsContext = struct {
 
         gctx.swapchain.present();
 
-        const win_size = gctx.window.getSize() catch unreachable;
         const fb_size = gctx.window.getFramebufferSize() catch unreachable;
         if (gctx.swapchain_descriptor.width != fb_size.width or
             gctx.swapchain_descriptor.height != fb_size.height)
@@ -340,17 +334,9 @@ pub const GraphicsContext = struct {
                 &gctx.swapchain_descriptor,
             );
 
-            gctx.window_width = win_size.width;
-            gctx.window_height = win_size.height;
-
             std.debug.print(
-                "[zgpu] Window has been resized to: {d}x{d} pixels ({d}x{d} units)\n",
-                .{
-                    gctx.swapchain_descriptor.width,
-                    gctx.swapchain_descriptor.height,
-                    gctx.window_width,
-                    gctx.window_height,
-                },
+                "[zgpu] Window has been resized to: {d}x{d}\n",
+                .{ gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height },
             );
             return .swap_chain_resized;
         }
@@ -921,9 +907,9 @@ pub fn checkContent(comptime content_dir: []const u8) !void {
 const FrameStats = struct {
     time: f64 = 0.0,
     delta_time: f32 = 0.0,
-    fps: f32 = 0.0,
+    fps: f64 = 0.0,
     fps_counter: u32 = 0,
-    average_cpu_time: f32 = 0.0,
+    average_cpu_time: f64 = 0.0,
     previous_time: f64 = 0.0,
     fps_refresh_time: f64 = 0.0,
     frame_number: u64 = 0,
@@ -938,8 +924,8 @@ const FrameStats = struct {
             const fps = @intToFloat(f64, stats.fps_counter) / t;
             const ms = (1.0 / fps) * 1000.0;
 
-            stats.fps = @floatCast(f32, fps);
-            stats.average_cpu_time = @floatCast(f32, ms);
+            stats.fps = fps;
+            stats.average_cpu_time = ms;
             stats.fps_refresh_time = stats.time;
             stats.fps_counter = 0;
         }
@@ -978,9 +964,17 @@ pub const gui = struct {
         cimgui.igDestroyContext(null);
     }
 
-    pub fn newFrame(win_width: u32, win_height: u32, fb_width: u32, fb_height: u32) void {
-        ImGui_ImplGlfw_NewFrame(win_width, win_height, fb_width, fb_height);
+    pub fn newFrame(fb_width: u32, fb_height: u32) void {
         ImGui_ImplWGPU_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        {
+            const io = cimgui.igGetIO().?;
+            io.*.DisplaySize = .{
+                .x = @intToFloat(f32, fb_width),
+                .y = @intToFloat(f32, fb_height),
+            };
+            io.*.DisplayFramebufferScale = .{ .x = 1.0, .y = 1.0 };
+        }
         cimgui.igNewFrame();
     }
 
@@ -990,7 +984,7 @@ pub const gui = struct {
     }
 
     extern fn ImGui_ImplGlfw_InitForOther(window: *anyopaque, install_callbacks: bool) bool;
-    extern fn ImGui_ImplGlfw_NewFrame(window_w: u32, window_h: u32, framebuffer_w: u32, framebuffer_h: u32) void;
+    extern fn ImGui_ImplGlfw_NewFrame() void;
     extern fn ImGui_ImplGlfw_Shutdown() void;
     extern fn ImGui_ImplWGPU_Init(device: *anyopaque, num_frames_in_flight: u32, rt_format: u32) bool;
     extern fn ImGui_ImplWGPU_NewFrame() void;
