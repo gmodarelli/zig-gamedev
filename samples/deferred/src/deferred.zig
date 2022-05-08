@@ -17,6 +17,7 @@ const zpix = @import("zpix");
 const zmesh = @import("zmesh");
 
 const Vec3 = vm.Vec3;
+const Vec4 = vm.Vec4;
 const Mat4 = vm.Mat4;
 
 pub export const D3D12SDKVersion: u32 = 4;
@@ -28,31 +29,13 @@ const window_name = "zig-gamedev: deferred";
 const window_width = 1920;
 const window_height = 1080;
 
-const PsoZPrePass_DrawRootConst = struct {
-    vertex_offset: u32,
-    index_offset: u32,
-};
-
-const PsoZPrePass_SceneConst = struct {
-    world_to_clip: Mat4,
-    position_buffer_index: u32,
-    index_buffer_index: u32,
-    texcoord_buffer_index: u32,
-    material_buffer_index: u32,
-};
-
-const PsoZPrePass_DrawConst = struct {
-    object_to_world: Mat4,
-    material_index: u32,
-};
-
-const PsoGeometry_DrawRootConst = struct {
-    vertex_offset: u32,
-    index_offset: u32,
-};
-
-const PsoGeometryPass_SceneConst = struct {
-    world_to_clip: Mat4,
+const SceneConst = struct {
+    view: Mat4,
+    proj: Mat4,
+    view_proj: Mat4,
+    inv_proj: Mat4,
+    inv_view: Mat4,
+    camera_position: Vec4,
     position_buffer_index: u32,
     normal_buffer_index: u32,
     texcoord_buffer_index: u32,
@@ -61,7 +44,7 @@ const PsoGeometryPass_SceneConst = struct {
     material_buffer_index: u32,
 };
 
-const PsoGeometry_DrawConst = struct {
+const DrawConst = struct {
     object_to_world: Mat4,
     material_index: u32,
 };
@@ -799,6 +782,23 @@ const DeferredSample = struct {
 
         const cam_world_to_clip = view_matrix.mul(proj_matrix);
 
+        // Set scene constants
+        const scene_const_mem = gctx.allocateUploadMemory(SceneConst, 1);
+        scene_const_mem.cpu_slice[0] = .{
+            .view = view_matrix.transpose(),
+            .proj = proj_matrix.transpose(),
+            .view_proj = cam_world_to_clip.transpose(),
+            .inv_view = inv_view_matrix.transpose(),
+            .inv_proj = inv_proj_matrix.transpose(),
+            .camera_position = Vec3.toVec4(sample.camera.position),
+            .position_buffer_index = sample.position_buffer.persistent_descriptor.index,
+            .normal_buffer_index = sample.normal_buffer.persistent_descriptor.index,
+            .texcoord_buffer_index = sample.texcoord_buffer.persistent_descriptor.index,
+            .tangent_buffer_index = sample.tangent_buffer.persistent_descriptor.index,
+            .index_buffer_index = sample.index_buffer.persistent_descriptor.index,
+            .material_buffer_index = sample.material_buffer.persistent_descriptor.index,
+        };
+
         // Z-PrePass
         {
             zpix.beginEvent(gctx.cmdlist, "Z Pre Pass");
@@ -814,16 +814,6 @@ const DeferredSample = struct {
 
             gctx.cmdlist.IASetPrimitiveTopology(.TRIANGLELIST);
 
-            // Set scene constants
-            const scene_const_mem = gctx.allocateUploadMemory(PsoZPrePass_SceneConst, 1);
-            scene_const_mem.cpu_slice[0] = .{
-                .world_to_clip = cam_world_to_clip.transpose(),
-                .position_buffer_index = sample.position_buffer.persistent_descriptor.index,
-                .index_buffer_index = sample.index_buffer.persistent_descriptor.index,
-                .texcoord_buffer_index = sample.texcoord_buffer.persistent_descriptor.index,
-                .material_buffer_index = sample.material_buffer.persistent_descriptor.index,
-            };
-
             {
                 gctx.setCurrentPipeline(sample.z_pre_pass_opaque_pso);
                 gctx.cmdlist.SetGraphicsRootConstantBufferView(1, scene_const_mem.gpu_base);
@@ -835,7 +825,7 @@ const DeferredSample = struct {
                     const mesh = &sample.meshes.items[mesh_index];
                     gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
                     // TODO: Replace this with a storage buffer?
-                    const draw_const_mem = gctx.allocateUploadMemory(PsoZPrePass_DrawConst, 1);
+                    const draw_const_mem = gctx.allocateUploadMemory(DrawConst, 1);
                     draw_const_mem.cpu_slice[0] = .{
                         .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
                         .material_index = mesh.material_index,
@@ -856,7 +846,7 @@ const DeferredSample = struct {
                     const mesh = &sample.meshes.items[mesh_index];
                     gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
                     // TODO: Replace this with a storage buffer?
-                    const draw_const_mem = gctx.allocateUploadMemory(PsoZPrePass_DrawConst, 1);
+                    const draw_const_mem = gctx.allocateUploadMemory(DrawConst, 1);
                     draw_const_mem.cpu_slice[0] = .{
                         .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
                         .material_index = mesh.material_index,
@@ -907,18 +897,6 @@ const DeferredSample = struct {
 
             gctx.cmdlist.IASetPrimitiveTopology(.TRIANGLELIST);
 
-            // Set scene constants
-            const scene_const_mem = gctx.allocateUploadMemory(PsoGeometryPass_SceneConst, 1);
-            scene_const_mem.cpu_slice[0] = .{
-                .world_to_clip = cam_world_to_clip.transpose(),
-                .position_buffer_index = sample.position_buffer.persistent_descriptor.index,
-                .normal_buffer_index = sample.normal_buffer.persistent_descriptor.index,
-                .texcoord_buffer_index = sample.texcoord_buffer.persistent_descriptor.index,
-                .tangent_buffer_index = sample.tangent_buffer.persistent_descriptor.index,
-                .index_buffer_index = sample.index_buffer.persistent_descriptor.index,
-                .material_buffer_index = sample.material_buffer.persistent_descriptor.index,
-            };
-
             {
                 zpix.beginEvent(gctx.cmdlist, "Opaque");
                 defer zpix.endEvent(gctx.cmdlist);
@@ -931,7 +909,7 @@ const DeferredSample = struct {
 
                     gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
                     // TODO: Replace this with a storage buffer?
-                    const draw_const_mem = gctx.allocateUploadMemory(PsoGeometry_DrawConst, 1);
+                    const draw_const_mem = gctx.allocateUploadMemory(DrawConst, 1);
                     draw_const_mem.cpu_slice[0] = .{
                         .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
                         .material_index = mesh.material_index,
@@ -953,7 +931,7 @@ const DeferredSample = struct {
 
                     gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
                     // TODO: Replace this with a storage buffer?
-                    const draw_const_mem = gctx.allocateUploadMemory(PsoGeometry_DrawConst, 1);
+                    const draw_const_mem = gctx.allocateUploadMemory(DrawConst, 1);
                     draw_const_mem.cpu_slice[0] = .{
                         .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
                         .material_index = mesh.material_index,
@@ -980,18 +958,11 @@ const DeferredSample = struct {
             gctx.setCurrentPipeline(sample.compute_shading_pso);
             gctx.cmdlist.SetComputeRoot32BitConstants(
                 0,
-                3, 
+                2, 
                 &.{ gctx.viewport_width, gctx.viewport_height },
                 0,
             );
 
-            // Set scene constants
-            const scene_const_mem = gctx.allocateUploadMemory(PsoDeferredShadingPass_SceneConst, 1);
-            scene_const_mem.cpu_slice[0] = .{
-                .inv_proj = inv_proj_matrix.transpose(),
-                .inv_view = inv_view_matrix.transpose(),
-                .camera_position = sample.camera.position,
-            };
             gctx.cmdlist.SetComputeRootConstantBufferView(1, scene_const_mem.gpu_base);
             gctx.cmdlist.SetComputeRootDescriptorTable(2, blk: {
                 const table = gctx.copyDescriptorsToGpuHeap(1, sample.depth_texture_srv);

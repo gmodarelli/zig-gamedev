@@ -1,5 +1,6 @@
 #define GAMMA 2.2
-#define PI 3.1415926
+
+#include "pbr.hlsl"
 
 struct Material {
     float3 base_color;
@@ -14,6 +15,26 @@ struct Material {
     float3 _padding;
 };
 
+struct SceneConst {
+    float4x4 view;
+    float4x4 proj;
+    float4x4 view_proj;
+    float4x4 inv_view;
+    float4x4 inv_proj;
+    float4 camera_position;
+    uint position_buffer_index;
+    uint normal_buffer_index;
+    uint texcoord_buffer_index;
+    uint tangent_buffer_index;
+    uint index_buffer_index;
+    uint material_buffer_index;
+};
+
+struct DrawConst {
+    float4x4 object_to_world;
+    uint material_index;
+};
+
 #if defined(PSO__Z_PRE_PASS) || defined(PSO__Z_PRE_PASS_ALPHA_TESTED)
 
 #define root_signature \
@@ -26,21 +47,6 @@ struct Material {
 struct DrawRootConst {
     uint vertex_offset;
     uint index_offset;
-};
-
-// TODO: Consider unifying this across all pipelines
-struct SceneConst {
-    float4x4 world_to_clip;
-    uint position_buffer_index;
-    uint index_buffer_index;
-    uint texcoord_buffer_index;
-    uint material_buffer_index;
-};
-
-// TODO: Consider unifying this across all pipelines
-struct DrawConst {
-    float4x4 object_to_world;
-    uint material_index;
 };
 
 ConstantBuffer<DrawRootConst> cbv_draw_root : register(b0);
@@ -61,7 +67,7 @@ void vsZPrePass(
     const uint vertex_index = srv_index_buffer[vertex_id + cbv_draw_root.index_offset] + cbv_draw_root.vertex_offset;
     const float3 position_os = srv_position_buffer[vertex_index];
 
-    const float4x4 object_to_clip = mul(cbv_draw_const.object_to_world, cbv_scene_const.world_to_clip);
+    const float4x4 object_to_clip = mul(cbv_draw_const.object_to_world, cbv_scene_const.view_proj);
     out_position_clip = mul(float4(position_os, 1.0), object_to_clip);
     out_uv = srv_texcoord_buffer[vertex_index];
 }
@@ -97,21 +103,6 @@ struct DrawRootConst {
     uint index_offset;
 };
 
-struct SceneConst {
-    float4x4 world_to_clip;
-    uint position_buffer_index;
-    uint normal_buffer_index;
-    uint texcoord_buffer_index;
-    uint tangent_buffer_index;
-    uint index_buffer_index;
-    uint material_buffer_index;
-};
-
-struct DrawConst {
-    float4x4 object_to_world;
-    uint material_index;
-};
-
 ConstantBuffer<DrawRootConst> cbv_draw_root : register(b0);
 ConstantBuffer<SceneConst> cbv_scene_const : register(b1);
 ConstantBuffer<DrawConst> cbv_draw_const : register(b2);
@@ -134,7 +125,7 @@ void vsGeometryPass(
     const uint vertex_index = srv_index_buffer[vertex_id + cbv_draw_root.index_offset] + cbv_draw_root.vertex_offset;
     const float3 position_os = srv_position_buffer[vertex_index];
 
-    const float4x4 object_to_clip = mul(cbv_draw_const.object_to_world, cbv_scene_const.world_to_clip);
+    const float4x4 object_to_clip = mul(cbv_draw_const.object_to_world, cbv_scene_const.view_proj);
     out_position_clip = mul(float4(position_os, 1.0), object_to_clip);
     
     out_uv = srv_texcoord_buffer[vertex_index];
@@ -206,21 +197,6 @@ struct DrawRootConst {
     uint screen_height;
 };
 
-struct Light {
-    float4 position_ws;     // position for point lights, direction for directional lights
-    float4 radiance;        // xyz: radiance. w: intensity
-    float radius;           // only used for point lights
-    uint type;              // 0: directional, 1: point
-    float2 _padding;
-};
-
-struct SceneConst {
-    float4x4 inverse_projection;
-    float4x4 inverse_view;
-    float3 camera_position;
-    float padding;
-};
-
 ConstantBuffer<DrawRootConst> cbv_root_const : register(b0);
 ConstantBuffer<SceneConst> cbv_scene_const : register(b1);
 
@@ -229,29 +205,6 @@ Texture2D<float4> gbuffer0 : register(t1);
 Texture2D<float4> gbuffer1 : register(t2);
 Texture2D<float4> gbuffer2 : register(t3);
 RWTexture2D<float4> output : register(u0);
-
-float3 fresnelSchlick(float cos_theta, float3 f0) {
-    return saturate(f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0));
-}
-
-float distributionGgx(float3 n, float3 h, float roughness) {
-    float alpha = roughness * roughness;
-    float alpha_sq = alpha * alpha;
-    float n_dot_h = dot(n, h);
-    float n_dot_h_sq = n_dot_h * n_dot_h;
-    float k = n_dot_h_sq * alpha_sq + (1.0 - n_dot_h_sq);
-    return alpha_sq / (PI * k * k);
-}
-
-float geometrySchlickGgx(float cos_theta, float roughness) {
-    float k = (roughness * roughness) * 0.5;
-    return cos_theta / (cos_theta * (1.0 - k) + k);
-}
-
-// Geometry function returns probability [0.0, 1.0].
-float geometrySmith(float n_dot_l, float n_dot_v, float roughness) {
-    return saturate(geometrySchlickGgx(n_dot_v, roughness) * geometrySchlickGgx(n_dot_l, roughness));
-}
 
 [RootSignature(root_signature)]
 [numthreads(16, 16, 1)]
@@ -263,9 +216,9 @@ void csDeferredShading(uint3 dispatch_id : SV_DispatchThreadID) {
         z,
         1.0
     );
-    float4 position_vs = mul(position_cs, cbv_scene_const.inverse_projection);
+    float4 position_vs = mul(position_cs, cbv_scene_const.inv_proj);
     position_vs /= position_vs.w;
-    float3 position_ws = mul(position_vs, cbv_scene_const.inverse_view).xyz;
+    float3 position_ws = mul(position_vs, cbv_scene_const.inv_view).xyz;
 
     // Extract base color from Gbuffer
     float3 base_color = gbuffer0.Load(uint3(dispatch_id.xy, 0)).rgb;
@@ -273,35 +226,19 @@ void csDeferredShading(uint3 dispatch_id : SV_DispatchThreadID) {
     float3 n = gbuffer1.Load(uint3(dispatch_id.xy, 0)).xyz * 2.0 - 1.0;
     // Extract metalness and roughness from Gbuffer
     float2 data = gbuffer2.Load(uint3(dispatch_id.xy, 0)).rg;
-    float metalness = data.r;
-    float roughness = data.g;
 
-    const float3 v = normalize(cbv_scene_const.camera_position - position_ws);
-    const float n_dot_v = saturate(dot(n, v));
+    PBRInput pbr_input = (PBRInput)0;
+    pbr_input.v = normalize(cbv_scene_const.camera_position.xyz - position_ws);
+    pbr_input.n = n;
+    pbr_input.metallic = data.r;
+    pbr_input.roughness = data.g;
 
-    float3 f0 = float3(0.04, 0.04, 0.04);
-    f0 = lerp(f0, base_color, metalness);
+    const float3 light_direction = float3(0.32139, 0.76604, -0.55667);
+    const float3 light_radiance = float3(14.0, 14.0, 10.0);
 
-    float3 lo = 0.0;
+    float3 lighting = calculateLighting(pbr_input, base_color, light_direction, light_radiance);
 
-    // Light contribution
-    const float3 l_radiance = float3(70.0, 70.0, 50.0);
-    const float3 l = float3(0.0, -1.0, 0.0);
-
-    float3 h = normalize(l + v);
-    float n_dot_l = saturate(dot(n, l));
-    float h_dot_v = saturate(dot(h, v));
-    float3 radiance = l_radiance;
-
-    float3 f = fresnelSchlick(h_dot_v, f0);
-    float nd = distributionGgx(n, h, roughness);
-    float g = geometrySmith(n_dot_l, n_dot_v, (roughness + 1.0) * 0.5);
-
-    float3 specular = (nd * g * f) / max(4.0 * n_dot_v * n_dot_l, 0.001);
-    float3 kd = (1.0 - f) * (1.0 - metalness);
-    lo += (kd * (base_color / PI) + specular) * radiance * n_dot_l;
-
-    output[dispatch_id.xy] = float4(lo, 1.0);
+    output[dispatch_id.xy] = float4(lighting, 1.0);
 }
 
 #elif defined(PSO__DEBUG_VIEW)
