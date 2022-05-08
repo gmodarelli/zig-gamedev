@@ -29,7 +29,7 @@ const window_name = "zig-gamedev: deferred";
 const window_width = 1920;
 const window_height = 1080;
 
-const SceneConst = struct {
+const FrameConst = struct {
     view: Mat4,
     proj: Mat4,
     view_proj: Mat4,
@@ -44,15 +44,12 @@ const SceneConst = struct {
     material_buffer_index: u32,
 };
 
+// TODO: Store model matrices in a storage buffer
+// instead of sending them before every draw call.
+// Material index can be sent then as Root Constant
 const DrawConst = struct {
     object_to_world: Mat4,
     material_index: u32,
-};
-
-const PsoDeferredShadingPass_SceneConst = struct {
-    inv_proj: Mat4,
-    inv_view: Mat4,
-    camera_position: Vec3,
 };
 
 const Mesh = struct {
@@ -78,6 +75,8 @@ const Material = struct {
     metallic_roughness_tex_index: u32,
     normal_tex_index: u32,
 
+    // TODO: alpha_cutoff is the only info we need on the GPU
+    // The rest are only used for draw calls sorting.
     alpha_cutoff: f32,
     double_sided: bool,
     alpha_mode: u8,
@@ -102,7 +101,7 @@ const RenderTarget = struct {
     uav: d3d12.CPU_DESCRIPTOR_HANDLE,
 };
 
-const DeferredSample = struct {
+const DeferredstateState = struct {
     gctx: zd3d12.GraphicsContext,
     guir: GuiRenderer,
     frame_stats: common.FrameStats,
@@ -140,13 +139,10 @@ const DeferredSample = struct {
     material_buffer: PersistentResource,
 
     meshes: std.ArrayList(Mesh),
-    materials: std.ArrayList(Material),
-    textures: std.ArrayList(Texture),
-    
     alpha_tested_mesh_indices: std.ArrayList(u32),
     opaque_mesh_indices: std.ArrayList(u32),
-
-    view_mode: i32,
+    materials: std.ArrayList(Material),
+    textures: std.ArrayList(Texture),
 
     camera: struct {
         position: Vec3,
@@ -161,7 +157,9 @@ const DeferredSample = struct {
         cursor_prev_y: i32,
     },
 
-    pub fn init(allocator: std.mem.Allocator) !DeferredSample {
+    view_mode: i32,
+
+    pub fn init(allocator: std.mem.Allocator) !DeferredstateState {
         const window = try common.initWindow(allocator, window_name, window_width, window_height);
 
         var arena_allocator_state = std.heap.ArenaAllocator.init(allocator);
@@ -596,7 +594,7 @@ const DeferredSample = struct {
                 }
             }
 
-            // Create Index Buffer, a persistent view and upload all indices to the GPU
+            // Create Material Buffer, a persistent view and upload all indices to the GPU
             const material_buffer = createPersistentResource(
                 &gctx,
                 &d3d12.RESOURCE_DESC.initBuffer(materials.items.len * @sizeOf(Material)),
@@ -631,7 +629,7 @@ const DeferredSample = struct {
         mipgen_rgba8.deinit(&gctx);
         _ = zpix.endCapture();
 
-        return DeferredSample{
+        return DeferredstateState{
             .gctx = gctx,
             .guir = guir,
             .frame_stats = common.FrameStats.init(),
@@ -681,98 +679,98 @@ const DeferredSample = struct {
         };
     }
 
-    pub fn deinit(sample: *DeferredSample, allocator: std.mem.Allocator) void {
-        sample.gctx.finishGpuCommands();
-        sample.guir.deinit(&sample.gctx);
-        sample.gctx.deinit(allocator);
+    pub fn deinit(state: *DeferredstateState, allocator: std.mem.Allocator) void {
+        state.gctx.finishGpuCommands();
+        state.guir.deinit(&state.gctx);
+        state.gctx.deinit(allocator);
         common.deinitWindow(allocator);
 
-        sample.meshes.deinit();
-        sample.materials.deinit();
-        sample.textures.deinit();
-        sample.alpha_tested_mesh_indices.deinit();
-        sample.opaque_mesh_indices.deinit();
-        sample.* = undefined;
+        state.meshes.deinit();
+        state.materials.deinit();
+        state.textures.deinit();
+        state.alpha_tested_mesh_indices.deinit();
+        state.opaque_mesh_indices.deinit();
+        state.* = undefined;
     }
 
-    pub fn update(sample: *DeferredSample) void {
-        sample.frame_stats.update(sample.gctx.window, window_name);
+    pub fn update(state: *DeferredstateState) void {
+        state.frame_stats.update(state.gctx.window, window_name);
 
-        common.newImGuiFrame(sample.frame_stats.delta_time);
+        common.newImGuiFrame(state.frame_stats.delta_time);
 
         _ = c.igBegin("Demo Settings", null, 0);
-        _ = c.igRadioButton_IntPtr("Lit", &sample.view_mode, 0);
-        _ = c.igRadioButton_IntPtr("Depth", &sample.view_mode, 1);
-        _ = c.igRadioButton_IntPtr("Albedo", &sample.view_mode, 2);
-        _ = c.igRadioButton_IntPtr("World Space Normals", &sample.view_mode, 3);
-        _ = c.igRadioButton_IntPtr("Metalness", &sample.view_mode, 4);
-        _ = c.igRadioButton_IntPtr("Roughness", &sample.view_mode, 5);
+        _ = c.igRadioButton_IntPtr("Lit", &state.view_mode, 0);
+        _ = c.igRadioButton_IntPtr("Depth", &state.view_mode, 1);
+        _ = c.igRadioButton_IntPtr("Albedo", &state.view_mode, 2);
+        _ = c.igRadioButton_IntPtr("World Space Normals", &state.view_mode, 3);
+        _ = c.igRadioButton_IntPtr("Metalness", &state.view_mode, 4);
+        _ = c.igRadioButton_IntPtr("Roughness", &state.view_mode, 5);
         c.igEnd();
         // Handle camera rotation with mouse.
         {
             var pos: w32.POINT = undefined;
             _ = w32.GetCursorPos(&pos);
-            const delta_x = @intToFloat(f32, pos.x) - @intToFloat(f32, sample.mouse.cursor_prev_x);
-            const delta_y = @intToFloat(f32, pos.y) - @intToFloat(f32, sample.mouse.cursor_prev_y);
-            sample.mouse.cursor_prev_x = pos.x;
-            sample.mouse.cursor_prev_y = pos.y;
+            const delta_x = @intToFloat(f32, pos.x) - @intToFloat(f32, state.mouse.cursor_prev_x);
+            const delta_y = @intToFloat(f32, pos.y) - @intToFloat(f32, state.mouse.cursor_prev_y);
+            state.mouse.cursor_prev_x = pos.x;
+            state.mouse.cursor_prev_y = pos.y;
 
             if (w32.GetAsyncKeyState(w32.VK_RBUTTON) < 0) {
-                sample.camera.pitch += 0.0025 * delta_y;
-                sample.camera.yaw += 0.0025 * delta_x;
-                sample.camera.pitch = math.min(sample.camera.pitch, 0.48 * math.pi);
-                sample.camera.pitch = math.max(sample.camera.pitch, -0.48 * math.pi);
-                sample.camera.yaw = vm.modAngle(sample.camera.yaw);
+                state.camera.pitch += 0.0025 * delta_y;
+                state.camera.yaw += 0.0025 * delta_x;
+                state.camera.pitch = math.min(state.camera.pitch, 0.48 * math.pi);
+                state.camera.pitch = math.max(state.camera.pitch, -0.48 * math.pi);
+                state.camera.yaw = vm.modAngle(state.camera.yaw);
             }
         }
 
         // Handle camera movement with 'WASDEQ' keys.
         {
             const speed: f32 = 5.0;
-            const delta_time = sample.frame_stats.delta_time;
-            const transform = Mat4.initRotationX(sample.camera.pitch).mul(Mat4.initRotationY(sample.camera.yaw));
+            const delta_time = state.frame_stats.delta_time;
+            const transform = Mat4.initRotationX(state.camera.pitch).mul(Mat4.initRotationY(state.camera.yaw));
             var forward = Vec3.init(0.0, 0.0, 1.0).transform(transform).normalize();
 
-            sample.camera.forward = forward;
+            state.camera.forward = forward;
             const right = Vec3.init(0.0, 1.0, 0.0).cross(forward).normalize().scale(speed * delta_time);
             forward = forward.scale(speed * delta_time);
 
-            const up = sample.camera.forward.cross(right).normalize().scale(speed * delta_time);
+            const up = state.camera.forward.cross(right).normalize().scale(speed * delta_time);
 
             if (w32.GetAsyncKeyState('W') < 0) {
-                sample.camera.position = sample.camera.position.add(forward);
+                state.camera.position = state.camera.position.add(forward);
             } else if (w32.GetAsyncKeyState('S') < 0) {
-                sample.camera.position = sample.camera.position.sub(forward);
+                state.camera.position = state.camera.position.sub(forward);
             }
 
             if (w32.GetAsyncKeyState('D') < 0) {
-                sample.camera.position = sample.camera.position.add(right);
+                state.camera.position = state.camera.position.add(right);
             } else if (w32.GetAsyncKeyState('A') < 0) {
-                sample.camera.position = sample.camera.position.sub(right);
+                state.camera.position = state.camera.position.sub(right);
             }
 
             if (w32.GetAsyncKeyState('E') < 0) {
-                sample.camera.position = sample.camera.position.add(up);
+                state.camera.position = state.camera.position.add(up);
             } else if (w32.GetAsyncKeyState('Q') < 0) {
-                sample.camera.position = sample.camera.position.sub(up);
+                state.camera.position = state.camera.position.sub(up);
             }
         }
     }
 
-    pub fn draw(sample: *DeferredSample) void {
-        var gctx = &sample.gctx;
+    pub fn draw(state: *DeferredstateState) void {
+        var gctx = &state.gctx;
         gctx.beginFrame();
 
         const view_matrix = vm.Mat4.initLookToLh(
-            sample.camera.position,
-            sample.camera.forward,
+            state.camera.position,
+            state.camera.forward,
             vm.Vec3.init(0.0, 1.0, 0.0),
         );
         const proj_matrix = vm.Mat4.initPerspectiveFovLh(
             math.pi / 3.0,
             @intToFloat(f32, gctx.viewport_width) / @intToFloat(f32, gctx.viewport_height),
-            sample.camera.znear,
-            sample.camera.zfar,
+            state.camera.znear,
+            state.camera.zfar,
         );
 
         var det: f32 = 0;
@@ -782,21 +780,21 @@ const DeferredSample = struct {
 
         const cam_world_to_clip = view_matrix.mul(proj_matrix);
 
-        // Set scene constants
-        const scene_const_mem = gctx.allocateUploadMemory(SceneConst, 1);
-        scene_const_mem.cpu_slice[0] = .{
+        // Set frame constants
+        const frame_const_mem = gctx.allocateUploadMemory(FrameConst, 1);
+        frame_const_mem.cpu_slice[0] = .{
             .view = view_matrix.transpose(),
             .proj = proj_matrix.transpose(),
             .view_proj = cam_world_to_clip.transpose(),
             .inv_view = inv_view_matrix.transpose(),
             .inv_proj = inv_proj_matrix.transpose(),
-            .camera_position = Vec3.toVec4(sample.camera.position),
-            .position_buffer_index = sample.position_buffer.persistent_descriptor.index,
-            .normal_buffer_index = sample.normal_buffer.persistent_descriptor.index,
-            .texcoord_buffer_index = sample.texcoord_buffer.persistent_descriptor.index,
-            .tangent_buffer_index = sample.tangent_buffer.persistent_descriptor.index,
-            .index_buffer_index = sample.index_buffer.persistent_descriptor.index,
-            .material_buffer_index = sample.material_buffer.persistent_descriptor.index,
+            .camera_position = Vec3.toVec4(state.camera.position),
+            .position_buffer_index = state.position_buffer.persistent_descriptor.index,
+            .normal_buffer_index = state.normal_buffer.persistent_descriptor.index,
+            .texcoord_buffer_index = state.texcoord_buffer.persistent_descriptor.index,
+            .tangent_buffer_index = state.tangent_buffer.persistent_descriptor.index,
+            .index_buffer_index = state.index_buffer.persistent_descriptor.index,
+            .material_buffer_index = state.material_buffer.persistent_descriptor.index,
         };
 
         // Z-PrePass
@@ -804,27 +802,26 @@ const DeferredSample = struct {
             zpix.beginEvent(gctx.cmdlist, "Z Pre Pass");
             defer zpix.endEvent(gctx.cmdlist);
 
-            gctx.addTransitionBarrier(sample.depth_texture, d3d12.RESOURCE_STATE_DEPTH_WRITE);
+            gctx.addTransitionBarrier(state.depth_texture, d3d12.RESOURCE_STATE_DEPTH_WRITE);
             gctx.flushResourceBarriers();
 
             // Bind and clear the depth buffer
-            gctx.cmdlist.OMSetRenderTargets(0, null, w32.TRUE, &sample.depth_texture_dsv);
+            gctx.cmdlist.OMSetRenderTargets(0, null, w32.TRUE, &state.depth_texture_dsv);
             // TODO: Switch to Reversed-Z
-            gctx.cmdlist.ClearDepthStencilView(sample.depth_texture_dsv, d3d12.CLEAR_FLAG_DEPTH, 1.0, 0, 0, null);
+            gctx.cmdlist.ClearDepthStencilView(state.depth_texture_dsv, d3d12.CLEAR_FLAG_DEPTH, 1.0, 0, 0, null);
 
             gctx.cmdlist.IASetPrimitiveTopology(.TRIANGLELIST);
 
             {
-                gctx.setCurrentPipeline(sample.z_pre_pass_opaque_pso);
-                gctx.cmdlist.SetGraphicsRootConstantBufferView(1, scene_const_mem.gpu_base);
+                gctx.setCurrentPipeline(state.z_pre_pass_opaque_pso);
+                gctx.cmdlist.SetGraphicsRootConstantBufferView(1, frame_const_mem.gpu_base);
 
                 zpix.beginEvent(gctx.cmdlist, "Opaque");
                 defer zpix.endEvent(gctx.cmdlist);
 
-                for (sample.opaque_mesh_indices.items) |mesh_index| {
-                    const mesh = &sample.meshes.items[mesh_index];
+                for (state.opaque_mesh_indices.items) |mesh_index| {
+                    const mesh = &state.meshes.items[mesh_index];
                     gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
-                    // TODO: Replace this with a storage buffer?
                     const draw_const_mem = gctx.allocateUploadMemory(DrawConst, 1);
                     draw_const_mem.cpu_slice[0] = .{
                         .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
@@ -836,16 +833,15 @@ const DeferredSample = struct {
             }
 
             {
-                gctx.setCurrentPipeline(sample.z_pre_pass_alpha_tested_pso);
-                gctx.cmdlist.SetGraphicsRootConstantBufferView(1, scene_const_mem.gpu_base);
+                gctx.setCurrentPipeline(state.z_pre_pass_alpha_tested_pso);
+                gctx.cmdlist.SetGraphicsRootConstantBufferView(1, frame_const_mem.gpu_base);
 
                 zpix.beginEvent(gctx.cmdlist, "Alpha Tested");
                 defer zpix.endEvent(gctx.cmdlist);
 
-                for (sample.alpha_tested_mesh_indices.items) |mesh_index| {
-                    const mesh = &sample.meshes.items[mesh_index];
+                for (state.alpha_tested_mesh_indices.items) |mesh_index| {
+                    const mesh = &state.meshes.items[mesh_index];
                     gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
-                    // TODO: Replace this with a storage buffer?
                     const draw_const_mem = gctx.allocateUploadMemory(DrawConst, 1);
                     draw_const_mem.cpu_slice[0] = .{
                         .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
@@ -863,33 +859,33 @@ const DeferredSample = struct {
             defer zpix.endEvent(gctx.cmdlist);
 
             // Transition the render targets to render target
-            gctx.addTransitionBarrier(sample.rt0.resource, d3d12.RESOURCE_STATE_RENDER_TARGET);
-            gctx.addTransitionBarrier(sample.rt1.resource, d3d12.RESOURCE_STATE_RENDER_TARGET);
-            gctx.addTransitionBarrier(sample.rt2.resource, d3d12.RESOURCE_STATE_RENDER_TARGET);
+            gctx.addTransitionBarrier(state.rt0.resource, d3d12.RESOURCE_STATE_RENDER_TARGET);
+            gctx.addTransitionBarrier(state.rt1.resource, d3d12.RESOURCE_STATE_RENDER_TARGET);
+            gctx.addTransitionBarrier(state.rt2.resource, d3d12.RESOURCE_STATE_RENDER_TARGET);
             gctx.flushResourceBarriers();
 
             // Bind GBuffer render targets
             gctx.cmdlist.OMSetRenderTargets(
                 3,
-                &[_]d3d12.CPU_DESCRIPTOR_HANDLE{ sample.rt0.rtv, sample.rt1.rtv, sample.rt2.rtv },
+                &[_]d3d12.CPU_DESCRIPTOR_HANDLE{ state.rt0.rtv, state.rt1.rtv, state.rt2.rtv },
                 w32.FALSE,
-                &sample.depth_texture_dsv,
+                &state.depth_texture_dsv,
             );
             // Clear render targets
             gctx.cmdlist.ClearRenderTargetView(
-                sample.rt0.rtv,
+                state.rt0.rtv,
                 &[4]f32{ 0.0, 0.0, 0.0, 1.0 },
                 0,
                 null,
             );
             gctx.cmdlist.ClearRenderTargetView(
-                sample.rt1.rtv,
+                state.rt1.rtv,
                 &[4]f32{ 0.0, 1.0, 0.0, 1.0 },
                 0,
                 null,
             );
             gctx.cmdlist.ClearRenderTargetView(
-                sample.rt2.rtv,
+                state.rt2.rtv,
                 &[4]f32{ 0.0, 0.5, 0.0, 1.0 },
                 0,
                 null,
@@ -901,14 +897,13 @@ const DeferredSample = struct {
                 zpix.beginEvent(gctx.cmdlist, "Opaque");
                 defer zpix.endEvent(gctx.cmdlist);
 
-                gctx.setCurrentPipeline(sample.geometry_pass_opaque_pso);
-                gctx.cmdlist.SetGraphicsRootConstantBufferView(1, scene_const_mem.gpu_base);
+                gctx.setCurrentPipeline(state.geometry_pass_opaque_pso);
+                gctx.cmdlist.SetGraphicsRootConstantBufferView(1, frame_const_mem.gpu_base);
 
-                for (sample.opaque_mesh_indices.items) |mesh_index| {
-                    const mesh = &sample.meshes.items[mesh_index];
+                for (state.opaque_mesh_indices.items) |mesh_index| {
+                    const mesh = &state.meshes.items[mesh_index];
 
                     gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
-                    // TODO: Replace this with a storage buffer?
                     const draw_const_mem = gctx.allocateUploadMemory(DrawConst, 1);
                     draw_const_mem.cpu_slice[0] = .{
                         .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
@@ -923,14 +918,13 @@ const DeferredSample = struct {
                 zpix.beginEvent(gctx.cmdlist, "Alpha Tested");
                 defer zpix.endEvent(gctx.cmdlist);
 
-                gctx.setCurrentPipeline(sample.geometry_pass_alpha_tested_pso);
-                gctx.cmdlist.SetGraphicsRootConstantBufferView(1, scene_const_mem.gpu_base);
+                gctx.setCurrentPipeline(state.geometry_pass_alpha_tested_pso);
+                gctx.cmdlist.SetGraphicsRootConstantBufferView(1, frame_const_mem.gpu_base);
 
-                for (sample.alpha_tested_mesh_indices.items) |mesh_index| {
-                    const mesh = &sample.meshes.items[mesh_index];
+                for (state.alpha_tested_mesh_indices.items) |mesh_index| {
+                    const mesh = &state.meshes.items[mesh_index];
 
                     gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
-                    // TODO: Replace this with a storage buffer?
                     const draw_const_mem = gctx.allocateUploadMemory(DrawConst, 1);
                     draw_const_mem.cpu_slice[0] = .{
                         .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
@@ -948,14 +942,14 @@ const DeferredSample = struct {
             defer zpix.endEvent(gctx.cmdlist);
 
             // Transition the depth buffer from Depth attachment to "Texture" attachment
-            gctx.addTransitionBarrier(sample.depth_texture, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(state.depth_texture, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             // Transition render targets to texurte attachments
-            gctx.addTransitionBarrier(sample.rt0.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            gctx.addTransitionBarrier(sample.rt1.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            gctx.addTransitionBarrier(sample.rt2.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(state.rt0.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(state.rt1.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(state.rt2.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             gctx.flushResourceBarriers();
 
-            gctx.setCurrentPipeline(sample.compute_shading_pso);
+            gctx.setCurrentPipeline(state.compute_shading_pso);
             gctx.cmdlist.SetComputeRoot32BitConstants(
                 0,
                 2, 
@@ -963,13 +957,13 @@ const DeferredSample = struct {
                 0,
             );
 
-            gctx.cmdlist.SetComputeRootConstantBufferView(1, scene_const_mem.gpu_base);
+            gctx.cmdlist.SetComputeRootConstantBufferView(1, frame_const_mem.gpu_base);
             gctx.cmdlist.SetComputeRootDescriptorTable(2, blk: {
-                const table = gctx.copyDescriptorsToGpuHeap(1, sample.depth_texture_srv);
-                _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt0.srv);
-                _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt1.srv);
-                _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt2.srv);
-                _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt_hdr.uav);
+                const table = gctx.copyDescriptorsToGpuHeap(1, state.depth_texture_srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.rt0.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.rt1.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.rt2.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.rt_hdr.uav);
                 break :blk table;
             });
 
@@ -983,11 +977,11 @@ const DeferredSample = struct {
             defer zpix.endEvent(gctx.cmdlist);
 
             // Transition the depth buffer from Depth attachment to "Texture" attachment
-            gctx.addTransitionBarrier(sample.depth_texture, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(state.depth_texture, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             // Transition render targets to texurte attachments
-            gctx.addTransitionBarrier(sample.rt0.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            gctx.addTransitionBarrier(sample.rt1.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            gctx.addTransitionBarrier(sample.rt2.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(state.rt0.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(state.rt1.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(state.rt2.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             // Transition the back buffer to render target
             gctx.addTransitionBarrier(back_buffer.resource_handle, d3d12.RESOURCE_STATE_RENDER_TARGET);
             gctx.flushResourceBarriers();
@@ -1005,24 +999,24 @@ const DeferredSample = struct {
                 null,
             );
 
-            gctx.setCurrentPipeline(sample.debug_view_pso);
+            gctx.setCurrentPipeline(state.debug_view_pso);
             gctx.cmdlist.SetGraphicsRoot32BitConstants(
                 0,
                 3,
-                &.{ sample.view_mode, sample.camera.znear, sample.camera.zfar },
+                &.{ state.view_mode, state.camera.znear, state.camera.zfar },
                 0,
             );
             gctx.cmdlist.SetGraphicsRootDescriptorTable(1, blk: {
-                const table = gctx.copyDescriptorsToGpuHeap(1, sample.depth_texture_srv);
-                _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt0.srv);
-                _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt1.srv);
-                _ = gctx.copyDescriptorsToGpuHeap(1, sample.rt2.srv);
+                const table = gctx.copyDescriptorsToGpuHeap(1, state.depth_texture_srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.rt0.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.rt1.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.rt2.srv);
                 break :blk table;
             });
             gctx.cmdlist.DrawInstanced(3, 1, 0, 0);
         }
 
-        sample.guir.draw(gctx);
+        state.guir.draw(gctx);
 
         gctx.addTransitionBarrier(back_buffer.resource_handle, d3d12.RESOURCE_STATE_PRESENT);
         gctx.flushResourceBarriers();
@@ -1149,11 +1143,11 @@ pub fn main() !void {
 
     const allocator = gpa.allocator();
 
-    var sample = try DeferredSample.init(allocator);
-    defer sample.deinit(allocator);
+    var state = try DeferredstateState.init(allocator);
+    defer state.deinit(allocator);
 
     while (common.handleWindowEvents()) {
-        sample.update();
-        sample.draw();
+        state.update();
+        state.draw();
     }
 }
