@@ -334,7 +334,7 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
 
         const vertex_attributes = [_]gpu.VertexAttribute{
             .{ .format = .float32x3, .offset = 0, .shader_location = 0 },
-            .{ .format = .float32x3, .offset = @sizeOf([3]f32), .shader_location = 1 },
+            .{ .format = .float32x3, .offset = @offsetOf(Vertex, "normal"), .shader_location = 1 },
         };
         const vertex_buffer_layout = gpu.VertexBufferLayout{
             .array_stride = @sizeOf(Vertex),
@@ -407,7 +407,7 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
     });
     gctx.queue.writeBuffer(gctx.lookupResource(index_buffer).?, 0, u16, meshes_indices.items);
 
-    // Create a depth texture and it's 'view'.
+    // Create a depth texture and its 'view'.
     const depth = createDepthTexture(gctx);
 
     return DemoState{
@@ -442,6 +442,10 @@ fn update(demo: *DemoState) void {
             "Average :  %.3f ms/frame (%.1f fps)",
             demo.gctx.stats.average_cpu_time,
             demo.gctx.stats.fps,
+        );
+        c.igBulletText(
+            "CPU is ahead of GPU by :  %d frame(s)",
+            demo.gctx.stats.cpu_frame_number - demo.gctx.stats.gpu_frame_number,
         );
     }
     c.igEnd();
@@ -634,15 +638,7 @@ fn createDepthTexture(gctx: *zgpu.GraphicsContext) struct {
         .mip_level_count = 1,
         .sample_count = 1,
     });
-    const view = gctx.createTextureView(texture, .{
-        .format = .depth32_float,
-        .dimension = .dimension_2d,
-        .base_mip_level = 0,
-        .mip_level_count = 1,
-        .base_array_layer = 0,
-        .array_layer_count = 1,
-        .aspect = .depth_only,
-    });
+    const view = gctx.createTextureView(texture, .{});
     return .{ .texture = texture, .view = view };
 }
 
@@ -670,7 +666,7 @@ pub fn main() !void {
     var demo = try init(allocator, window);
     defer deinit(allocator, &demo);
 
-    zgpu.gui.init(window, demo.gctx.device, content_dir ++ "Roboto-Medium.ttf", 25.0);
+    zgpu.gui.init(window, demo.gctx.device, content_dir, "Roboto-Medium.ttf", 25.0);
     defer zgpu.gui.deinit();
 
     while (!window.shouldClose()) {

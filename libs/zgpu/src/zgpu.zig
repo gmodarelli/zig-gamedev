@@ -143,12 +143,36 @@ pub const GraphicsContext = struct {
             .bind_group_layout_pool = BindGroupLayoutPool.init(allocator, bind_group_layout_pool_size),
         };
 
+        gctx.queue.on_submitted_work_done = gpu.Queue.WorkDoneCallback.init(
+            *u64,
+            &gctx.stats.gpu_frame_number,
+            gpuWorkDone,
+        );
+
         uniformsInit(gctx);
         return gctx;
     }
 
     pub fn deinit(gctx: *GraphicsContext, allocator: std.mem.Allocator) void {
         // TODO: How to release `native_instance`?
+
+        // Wait for the GPU to finish all encoded commands.
+        while (gctx.stats.cpu_frame_number != gctx.stats.gpu_frame_number) {
+            gctx.device.tick();
+        }
+
+        // Wait for all outstanding mapAsync() calls to complete.
+        wait_loop: while (true) {
+            gctx.device.tick();
+            var i: u32 = 0;
+            while (i < gctx.uniforms.stage.num) : (i += 1) {
+                if (gctx.uniforms.stage.buffers[i].slice == null) {
+                    continue :wait_loop;
+                }
+            }
+            break;
+        }
+
         gctx.bind_group_pool.deinit(allocator);
         gctx.bind_group_layout_pool.deinit(allocator);
         gctx.buffer_pool.deinit(allocator);
@@ -214,12 +238,12 @@ pub const GraphicsContext = struct {
         if (status == .success) {
             usb.slice = usb.buffer.getMappedRange(u8, 0, uniforms_buffer_size);
         } else {
-            std.debug.print("[zgpu] Failed to map buffer\n", .{});
+            std.debug.print("[zgpu] Failed to map buffer (code: {d})\n", .{@enumToInt(status)});
         }
     }
 
     fn uniformsNextStagingBuffer(gctx: *GraphicsContext) void {
-        if (gctx.stats.frame_number > 0) {
+        if (gctx.stats.cpu_frame_number > 0) {
             // Map staging buffer which was used this frame.
             const current = gctx.uniforms.stage.current;
             assert(gctx.uniforms.stage.buffers[current].slice == null);
@@ -242,7 +266,7 @@ pub const GraphicsContext = struct {
         }
 
         if (gctx.uniforms.stage.num >= uniforms_staging_pipeline_len) {
-            // TODO: Wait for the GPU to finish all commands. Not sure if this is the best way.
+            // Wait until one of the buffers is mapped and ready to use.
             while (true) {
                 gctx.device.tick();
 
@@ -317,7 +341,7 @@ pub const GraphicsContext = struct {
         command_buffers.appendSlice(commands) catch unreachable;
         gctx.queue.submit(command_buffers.slice());
 
-        gctx.stats.update();
+        gctx.stats.tick();
         gctx.uniformsNextStagingBuffer();
 
         gctx.swapchain.present();
@@ -341,6 +365,13 @@ pub const GraphicsContext = struct {
             return .swap_chain_resized;
         }
         return .nothing_special_happened;
+    }
+
+    fn gpuWorkDone(gpu_frame_number: *u64, status: gpu.Queue.WorkDoneStatus) void {
+        gpu_frame_number.* += 1;
+        if (status != .Success) {
+            std.debug.print("[zgpu] Failed to complete GPU work (code: {d})\n", .{@enumToInt(status)});
+        }
     }
 
     //
@@ -372,13 +403,24 @@ pub const GraphicsContext = struct {
         descriptor: gpu.TextureView.Descriptor,
     ) TextureViewHandle {
         const texture = gctx.lookupResource(texture_handle).?;
+        const info = gctx.lookupResourceInfo(texture_handle).?;
         return gctx.texture_view_pool.addResource(gctx.*, .{
             .gpuobj = texture.createView(&descriptor),
-            .format = descriptor.format,
-            .dimension = descriptor.dimension,
+            .format = if (descriptor.format == .none) info.format else descriptor.format,
+            .dimension = if (descriptor.dimension == .dimension_none)
+                @intToEnum(gpu.TextureView.Dimension, @enumToInt(info.dimension))
+            else
+                descriptor.dimension,
             .base_mip_level = descriptor.base_mip_level,
+            .mip_level_count = if (descriptor.mip_level_count == 0xffff_ffff)
+                info.mip_level_count
+            else
+                descriptor.mip_level_count,
             .base_array_layer = descriptor.base_array_layer,
-            .array_layer_count = descriptor.array_layer_count,
+            .array_layer_count = if (descriptor.array_layer_count == 0xffff_ffff)
+                info.size.depth_or_array_layers
+            else
+                descriptor.array_layer_count,
             .aspect = descriptor.aspect,
             .parent_texture_handle = texture_handle,
         });
@@ -699,6 +741,7 @@ pub const TextureViewInfo = struct {
     format: gpu.Texture.Format = .none,
     dimension: gpu.TextureView.Dimension = .dimension_none,
     base_mip_level: u32 = 0,
+    mip_level_count: u32 = 0,
     base_array_layer: u32 = 0,
     array_layer_count: u32 = 0,
     aspect: gpu.Texture.Aspect = .all,
@@ -907,14 +950,15 @@ pub fn checkContent(comptime content_dir: []const u8) !void {
 const FrameStats = struct {
     time: f64 = 0.0,
     delta_time: f32 = 0.0,
-    fps: f64 = 0.0,
     fps_counter: u32 = 0,
+    fps: f64 = 0.0,
     average_cpu_time: f64 = 0.0,
     previous_time: f64 = 0.0,
     fps_refresh_time: f64 = 0.0,
-    frame_number: u64 = 0,
+    cpu_frame_number: u64 = 0,
+    gpu_frame_number: u64 = 0,
 
-    fn update(stats: *FrameStats) void {
+    fn tick(stats: *FrameStats) void {
         stats.time = glfw.getTime();
         stats.delta_time = @floatCast(f32, stats.time - stats.previous_time);
         stats.previous_time = stats.time;
@@ -930,12 +974,18 @@ const FrameStats = struct {
             stats.fps_counter = 0;
         }
         stats.fps_counter += 1;
-        stats.frame_number += 1;
+        stats.cpu_frame_number += 1;
     }
 };
 
 pub const gui = struct {
-    pub fn init(window: glfw.Window, device: gpu.Device, font: [*:0]const u8, font_size: f32) void {
+    pub fn init(
+        window: glfw.Window,
+        device: gpu.Device,
+        comptime content_dir: []const u8,
+        comptime font_name: [*:0]const u8,
+        font_size: f32,
+    ) void {
         assert(cimgui.igGetCurrentContext() == null);
         _ = cimgui.igCreateContext(null);
 
@@ -944,7 +994,13 @@ pub const gui = struct {
         }
 
         const io = cimgui.igGetIO().?;
-        if (cimgui.ImFontAtlas_AddFontFromFileTTF(io.*.Fonts, font, font_size, null, null) == null) {
+        if (cimgui.ImFontAtlas_AddFontFromFileTTF(
+            io.*.Fonts,
+            content_dir ++ font_name,
+            font_size,
+            null,
+            null,
+        ) == null) {
             unreachable;
         }
 
@@ -955,6 +1011,8 @@ pub const gui = struct {
         )) {
             unreachable;
         }
+
+        io.*.IniFilename = content_dir ++ "imgui.ini";
     }
 
     pub fn deinit() void {
