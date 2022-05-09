@@ -147,6 +147,15 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
     dxc_command = makeDxcCmd(
+        "src/hlsl/light_culling.hlsl",
+        "csComputeFrustum",
+        "compute_frustums.cs.cso",
+        "cs",
+        "PSO__LIGHTING_COMPUTE_FRUSTUMS",
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
         "src/hlsl/deferred.hlsl",
         "vsDebugView",
         "debug_view.vs.cso",

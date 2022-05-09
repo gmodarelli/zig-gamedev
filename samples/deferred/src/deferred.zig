@@ -44,6 +44,11 @@ const FrameConst = struct {
     material_buffer_index: u32,
 };
 
+const DispatchParams = struct {
+    num_thread_groups: [4]u32,
+    num_threads: [4]u32,
+};
+
 // TODO: Store model matrices in a storage buffer
 // instead of sending them before every draw call.
 // Material index can be sent then as Root Constant
@@ -123,6 +128,7 @@ const DeferredstateState = struct {
     rt_hdr: RenderTarget,
 
     // PSOs
+    compute_frustums_pso: zd3d12.PipelineHandle,
     z_pre_pass_opaque_pso: zd3d12.PipelineHandle,
     z_pre_pass_alpha_tested_pso: zd3d12.PipelineHandle,
     geometry_pass_opaque_pso: zd3d12.PipelineHandle,
@@ -138,11 +144,17 @@ const DeferredstateState = struct {
     index_buffer: PersistentResource,
     material_buffer: PersistentResource,
 
+    frustums_buffer: zd3d12.ResourceHandle,
+    frustums_buffer_srv: d3d12.CPU_DESCRIPTOR_HANDLE,
+    frustums_buffer_uav: d3d12.CPU_DESCRIPTOR_HANDLE,
+
     meshes: std.ArrayList(Mesh),
     alpha_tested_mesh_indices: std.ArrayList(u32),
     opaque_mesh_indices: std.ArrayList(u32),
     materials: std.ArrayList(Material),
     textures: std.ArrayList(Texture),
+
+    need_to_compute_frustrums: bool,
 
     camera: struct {
         position: Vec3,
@@ -176,6 +188,17 @@ const DeferredstateState = struct {
         var gctx = zd3d12.GraphicsContext.init(allocator, window);
 
         // Initialize PSOs
+        // Compute Deferred Shading
+        const compute_frustums_pso = blk: {
+            var pso_desc = d3d12.COMPUTE_PIPELINE_STATE_DESC.initDefault();
+
+            break :blk gctx.createComputeShaderPipeline(
+                arena_allocator,
+                &pso_desc,
+                content_dir ++ "shaders/compute_frustums.cs.cso",
+            );
+        };
+
         // Z-PrePass
         const z_pre_pass_psos = blk: {
             var pso_desc = d3d12.GRAPHICS_PIPELINE_STATE_DESC.initDefault();
@@ -316,6 +339,44 @@ const DeferredstateState = struct {
         gctx.beginFrame();
 
         var guir = GuiRenderer.init(arena_allocator, &gctx, 1, content_dir);
+
+        // Create Frustums Buffer and its SRV and UAV
+        const num_frustums: u32 = (gctx.viewport_width / 16) * (gctx.viewport_height / 16);
+        const frustums_buffer = gctx.createCommittedResource(
+            .DEFAULT,
+            d3d12.HEAP_FLAG_NONE,
+            &blk: {
+                var desc = d3d12.RESOURCE_DESC.initBuffer(num_frustums * @sizeOf([16]f32));
+                desc.Flags = d3d12.RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                break :blk desc;
+            },
+            d3d12.RESOURCE_STATE_UNORDERED_ACCESS,
+            null,
+        ) catch |err| hrPanic(err);
+
+        const frustums_buffer_srv = gctx.allocateCpuDescriptors(.CBV_SRV_UAV, 1);
+        gctx.device.CreateShaderResourceView(
+            gctx.lookupResource(frustums_buffer).?,
+            &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(
+                0, // FirstElement
+                num_frustums, // NumElements
+                @sizeOf([16]f32), // StructureByteStride
+            ),
+            frustums_buffer_srv,
+        );
+
+        const frustums_buffer_uav = gctx.allocateCpuDescriptors(.CBV_SRV_UAV, 1);
+        gctx.device.CreateUnorderedAccessView(
+            gctx.lookupResource(frustums_buffer).?,
+            null,
+            &d3d12.UNORDERED_ACCESS_VIEW_DESC.initStructuredBuffer(
+                0,
+                num_frustums,
+                @sizeOf([16]f32),
+                0, // CounterOffsetInBytes
+            ),
+            frustums_buffer_uav,
+        );
 
         // Load Sponza
         const geometry = blk: {
@@ -643,6 +704,7 @@ const DeferredstateState = struct {
             .rt2 = rt2,
             .rt_hdr = rt_hdr,
 
+            .compute_frustums_pso = compute_frustums_pso,
             .z_pre_pass_opaque_pso = z_pre_pass_psos.opaque_pso,
             .z_pre_pass_alpha_tested_pso = z_pre_pass_psos.alpha_tested_pso,
             .geometry_pass_opaque_pso = geometry_pass_psos.opaque_pso,
@@ -661,6 +723,11 @@ const DeferredstateState = struct {
             .tangent_buffer = geometry.tangent_buffer,
             .index_buffer = geometry.index_buffer,
             .material_buffer = geometry.material_buffer,
+
+            .need_to_compute_frustrums = true,
+            .frustums_buffer = frustums_buffer,
+            .frustums_buffer_srv = frustums_buffer_srv,
+            .frustums_buffer_uav = frustums_buffer_uav,
 
             .view_mode = 2,
 
@@ -796,6 +863,35 @@ const DeferredstateState = struct {
             .index_buffer_index = state.index_buffer.persistent_descriptor.index,
             .material_buffer_index = state.material_buffer.persistent_descriptor.index,
         };
+
+        // Compute Frustum Grid
+        if (state.need_to_compute_frustrums) {
+            zpix.beginEvent(gctx.cmdlist, "Compute Frustum Grid");
+            defer zpix.endEvent(gctx.cmdlist);
+
+            state.need_to_compute_frustrums = false;
+
+            const dispatch_params = gctx.allocateUploadMemory(DispatchParams, 1);
+            dispatch_params.cpu_slice[0] = .{
+                .num_thread_groups = [4]u32{ 0, 0, 0, 0 },
+                .num_threads = [4]u32{ gctx.viewport_width / 16, gctx.viewport_height / 16, 0, 0 },
+            };
+
+            gctx.setCurrentPipeline(state.compute_frustums_pso);
+            gctx.cmdlist.SetComputeRoot32BitConstants(
+                0,
+                2, 
+                &.{ gctx.viewport_width, gctx.viewport_height },
+                0,
+            );
+            gctx.cmdlist.SetComputeRootConstantBufferView(1, frame_const_mem.gpu_base);
+            gctx.cmdlist.SetComputeRootConstantBufferView(2, dispatch_params.gpu_base);
+            gctx.cmdlist.SetComputeRootDescriptorTable(
+                3,
+                gctx.copyDescriptorsToGpuHeap(1, state.frustums_buffer_uav),
+            );
+            gctx.cmdlist.Dispatch(gctx.viewport_width / 16, gctx.viewport_height / 16, 1);
+        }
 
         // Z-PrePass
         {
@@ -1030,7 +1126,7 @@ const DeferredstateState = struct {
         srv_desc: *d3d12.SHADER_RESOURCE_VIEW_DESC,
         state_after: d3d12.RESOURCE_STATES,
         comptime T: type,
-        data: *std.ArrayList(T),
+        optional_data: ?*std.ArrayList(T),
     ) PersistentResource {
         const resource = gctx.createCommittedResource(
             .DEFAULT,
@@ -1046,7 +1142,7 @@ const DeferredstateState = struct {
             persistent_descriptor.cpu_handle,
         );
 
-        {
+        if (optional_data) |data| {
             const upload = gctx.allocateUploadBufferRegion(T, @intCast(u32, data.items.len));
             for (data.items) |element, i| {
                 upload.cpu_slice[i] = element;
@@ -1058,9 +1154,10 @@ const DeferredstateState = struct {
                 upload.buffer_offset,
                 upload.cpu_slice.len * @sizeOf(@TypeOf(upload.cpu_slice[0])),
             );
-            gctx.addTransitionBarrier(resource, state_after);
-            gctx.flushResourceBarriers();
         }
+
+        gctx.addTransitionBarrier(resource, state_after);
+        gctx.flushResourceBarriers();
 
         return PersistentResource{
             .resource = resource,

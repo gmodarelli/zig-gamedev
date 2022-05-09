@@ -1,39 +1,7 @@
 #define GAMMA 2.2
 
+#include "common.hlsl"
 #include "pbr.hlsl"
-
-struct Material {
-    float3 base_color;
-    float roughness;
-
-    float metallic;
-    uint base_color_tex_index;
-    uint metallic_roughness_tex_index;
-    uint normal_tex_index;
-
-    float alpha_cutoff;
-    float3 _padding;
-};
-
-struct SceneConst {
-    float4x4 view;
-    float4x4 proj;
-    float4x4 view_proj;
-    float4x4 inv_view;
-    float4x4 inv_proj;
-    float4 camera_position;
-    uint position_buffer_index;
-    uint normal_buffer_index;
-    uint texcoord_buffer_index;
-    uint tangent_buffer_index;
-    uint index_buffer_index;
-    uint material_buffer_index;
-};
-
-struct DrawConst {
-    float4x4 object_to_world;
-    uint material_index;
-};
 
 #if defined(PSO__Z_PRE_PASS) || defined(PSO__Z_PRE_PASS_ALPHA_TESTED)
 
@@ -50,7 +18,7 @@ struct DrawRootConst {
 };
 
 ConstantBuffer<DrawRootConst> cbv_draw_root : register(b0);
-ConstantBuffer<SceneConst> cbv_scene_const : register(b1);
+ConstantBuffer<FrameConst> cvb_frame_const : register(b1);
 ConstantBuffer<DrawConst> cbv_draw_const : register(b2);
 SamplerState sam_aniso : register(s0);
 
@@ -60,14 +28,14 @@ void vsZPrePass(
     out float4 out_position_clip : SV_Position,
     out float2 out_uv: TEXCOORD0
 ) {
-    StructuredBuffer<float3> srv_position_buffer = ResourceDescriptorHeap[cbv_scene_const.position_buffer_index];
-    StructuredBuffer<float2> srv_texcoord_buffer = ResourceDescriptorHeap[cbv_scene_const.texcoord_buffer_index];
-    Buffer<uint> srv_index_buffer = ResourceDescriptorHeap[cbv_scene_const.index_buffer_index];
+    StructuredBuffer<float3> srv_position_buffer = ResourceDescriptorHeap[cvb_frame_const.position_buffer_index];
+    StructuredBuffer<float2> srv_texcoord_buffer = ResourceDescriptorHeap[cvb_frame_const.texcoord_buffer_index];
+    Buffer<uint> srv_index_buffer = ResourceDescriptorHeap[cvb_frame_const.index_buffer_index];
 
     const uint vertex_index = srv_index_buffer[vertex_id + cbv_draw_root.index_offset] + cbv_draw_root.vertex_offset;
     const float3 position_os = srv_position_buffer[vertex_index];
 
-    const float4x4 object_to_clip = mul(cbv_draw_const.object_to_world, cbv_scene_const.view_proj);
+    const float4x4 object_to_clip = mul(cbv_draw_const.object_to_world, cvb_frame_const.view_proj);
     out_position_clip = mul(float4(position_os, 1.0), object_to_clip);
     out_uv = srv_texcoord_buffer[vertex_index];
 }
@@ -78,7 +46,7 @@ void psZPrePass(
     float2 uvs : TEXCOORD0
 ) {
 #if defined(PSO__Z_PRE_PASS_ALPHA_TESTED)
-    StructuredBuffer<Material> srv_material_buffer = ResourceDescriptorHeap[cbv_scene_const.material_buffer_index];
+    StructuredBuffer<Material> srv_material_buffer = ResourceDescriptorHeap[cvb_frame_const.material_buffer_index];
     Material material = srv_material_buffer[cbv_draw_const.material_index];
 
     if (material.base_color_tex_index < 0xffffffff) {
@@ -104,7 +72,7 @@ struct DrawRootConst {
 };
 
 ConstantBuffer<DrawRootConst> cbv_draw_root : register(b0);
-ConstantBuffer<SceneConst> cbv_scene_const : register(b1);
+ConstantBuffer<FrameConst> cvb_frame_const : register(b1);
 ConstantBuffer<DrawConst> cbv_draw_const : register(b2);
 SamplerState sam_aniso : register(s0);
 
@@ -116,16 +84,16 @@ void vsGeometryPass(
     out float3 out_normal : NORMAL,
     out float4 out_tangent : TANGENT
 ) {
-    StructuredBuffer<float3> srv_position_buffer = ResourceDescriptorHeap[cbv_scene_const.position_buffer_index];
-    StructuredBuffer<float3> srv_normal_buffer = ResourceDescriptorHeap[cbv_scene_const.normal_buffer_index];
-    StructuredBuffer<float4> srv_tangent_buffer = ResourceDescriptorHeap[cbv_scene_const.tangent_buffer_index];
-    StructuredBuffer<float2> srv_texcoord_buffer = ResourceDescriptorHeap[cbv_scene_const.texcoord_buffer_index];
-    Buffer<uint> srv_index_buffer = ResourceDescriptorHeap[cbv_scene_const.index_buffer_index];
+    StructuredBuffer<float3> srv_position_buffer = ResourceDescriptorHeap[cvb_frame_const.position_buffer_index];
+    StructuredBuffer<float3> srv_normal_buffer = ResourceDescriptorHeap[cvb_frame_const.normal_buffer_index];
+    StructuredBuffer<float4> srv_tangent_buffer = ResourceDescriptorHeap[cvb_frame_const.tangent_buffer_index];
+    StructuredBuffer<float2> srv_texcoord_buffer = ResourceDescriptorHeap[cvb_frame_const.texcoord_buffer_index];
+    Buffer<uint> srv_index_buffer = ResourceDescriptorHeap[cvb_frame_const.index_buffer_index];
 
     const uint vertex_index = srv_index_buffer[vertex_id + cbv_draw_root.index_offset] + cbv_draw_root.vertex_offset;
     const float3 position_os = srv_position_buffer[vertex_index];
 
-    const float4x4 object_to_clip = mul(cbv_draw_const.object_to_world, cbv_scene_const.view_proj);
+    const float4x4 object_to_clip = mul(cbv_draw_const.object_to_world, cvb_frame_const.view_proj);
     out_position_clip = mul(float4(position_os, 1.0), object_to_clip);
     
     out_uv = srv_texcoord_buffer[vertex_index];
@@ -143,7 +111,7 @@ void psGeometryPass(
     out float4 gbuffer1 : SV_Target1,
     out float4 gbuffer2 : SV_Target2
 ) {
-    StructuredBuffer<Material> srv_material_buffer = ResourceDescriptorHeap[cbv_scene_const.material_buffer_index];
+    StructuredBuffer<Material> srv_material_buffer = ResourceDescriptorHeap[cvb_frame_const.material_buffer_index];
     Material material = srv_material_buffer[cbv_draw_const.material_index];
 
     float3 albedo = material.base_color;
@@ -198,7 +166,7 @@ struct DrawRootConst {
 };
 
 ConstantBuffer<DrawRootConst> cbv_root_const : register(b0);
-ConstantBuffer<SceneConst> cbv_scene_const : register(b1);
+ConstantBuffer<FrameConst> cvb_frame_const : register(b1);
 
 Texture2D<float4> depth_texture : register(t0);
 Texture2D<float4> gbuffer0 : register(t1);
@@ -216,9 +184,9 @@ void csDeferredShading(uint3 dispatch_id : SV_DispatchThreadID) {
         z,
         1.0
     );
-    float4 position_vs = mul(position_cs, cbv_scene_const.inv_proj);
+    float4 position_vs = mul(position_cs, cvb_frame_const.inv_proj);
     position_vs /= position_vs.w;
-    float3 position_ws = mul(position_vs, cbv_scene_const.inv_view).xyz;
+    float3 position_ws = mul(position_vs, cvb_frame_const.inv_view).xyz;
 
     // Extract base color from Gbuffer
     float3 base_color = gbuffer0.Load(uint3(dispatch_id.xy, 0)).rgb;
@@ -228,7 +196,7 @@ void csDeferredShading(uint3 dispatch_id : SV_DispatchThreadID) {
     float2 data = gbuffer2.Load(uint3(dispatch_id.xy, 0)).rg;
 
     PBRInput pbr_input = (PBRInput)0;
-    pbr_input.v = normalize(cbv_scene_const.camera_position.xyz - position_ws);
+    pbr_input.v = normalize(cvb_frame_const.camera_position.xyz - position_ws);
     pbr_input.n = n;
     pbr_input.metallic = data.r;
     pbr_input.roughness = data.g;
