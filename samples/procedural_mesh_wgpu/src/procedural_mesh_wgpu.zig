@@ -303,22 +303,16 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const bgl = gctx.createBindGroupLayout(
-        gpu.BindGroupLayout.Descriptor{
-            .entries = &.{
-                gpu.BindGroupLayout.Entry.buffer(0, .{ .vertex = true, .fragment = true }, .uniform, true, 0),
-            },
-        },
-    );
-    defer gctx.destroyResource(bgl);
-
-    const pl = gctx.device.createPipelineLayout(&gpu.PipelineLayout.Descriptor{
-        .bind_group_layouts = &.{
-            gctx.lookupResource(bgl).?,
-            gctx.lookupResource(bgl).?,
-        },
+    const bind_group_layout = gctx.createBindGroupLayout(&.{
+        zgpu.bglBuffer(0, .{ .vertex = true, .fragment = true }, .uniform, true, 0),
     });
-    defer pl.release();
+    defer gctx.destroyResource(bind_group_layout);
+
+    const pipeline_layout = gctx.createPipelineLayout(&.{
+        bind_group_layout,
+        bind_group_layout,
+    });
+    defer gctx.destroyResource(pipeline_layout);
 
     const pipeline = pipeline: {
         const vs_module = gctx.device.createShaderModule(&.{ .label = "vs", .code = .{ .wgsl = wgsl.vs } });
@@ -344,15 +338,14 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
 
         // Create a render pipeline.
         const pipeline_descriptor = gpu.RenderPipeline.Descriptor{
-            .layout = pl,
             .vertex = gpu.VertexState{
                 .module = vs_module,
                 .entry_point = "main",
                 .buffers = &.{vertex_buffer_layout},
             },
             .primitive = gpu.PrimitiveState{
-                .front_face = .ccw,
-                .cull_mode = .none,
+                .front_face = .cw,
+                .cull_mode = .back,
                 .topology = .triangle_list,
             },
             .depth_stencil = &gpu.DepthStencilState{
@@ -366,10 +359,10 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
                 .targets = &.{color_target},
             },
         };
-        break :pipeline gctx.createRenderPipeline(pipeline_descriptor);
+        break :pipeline gctx.createRenderPipeline(pipeline_layout, pipeline_descriptor);
     };
 
-    const bind_group = gctx.createBindGroup(bgl, &[_]zgpu.BindGroupEntryInfo{
+    const bind_group = gctx.createBindGroup(bind_group_layout, &[_]zgpu.BindGroupEntryInfo{
         .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = 256 },
     });
 
@@ -433,9 +426,7 @@ fn deinit(allocator: std.mem.Allocator, demo: *DemoState) void {
 fn update(demo: *DemoState) void {
     zgpu.gui.newFrame(demo.gctx.swapchain_descriptor.width, demo.gctx.swapchain_descriptor.height);
 
-    c.igSetNextWindowPos(.{ .x = 20.0, .y = 20.0 }, c.ImGuiCond_FirstUseEver, .{ .x = 0.0, .y = 0.0 });
-    c.igSetNextWindowSize(.{ .x = 500.0, .y = -1.0 }, c.ImGuiCond_FirstUseEver);
-    if (c.igBegin("Demo Settings", null, c.ImGuiWindowFlags_NoResize)) {
+    if (c.igBegin("Demo Settings", null, c.ImGuiWindowFlags_NoMove | c.ImGuiWindowFlags_NoResize)) {
         c.igBulletText("Right Mouse Button + drag :  rotate camera");
         c.igBulletText("W, A, S, D :  move camera");
         c.igBulletText(
@@ -610,7 +601,9 @@ fn draw(demo: *DemoState) void {
     };
     defer commands.release();
 
-    if (gctx.submitAndPresent(&.{commands}) == .swap_chain_resized) {
+    gctx.submit(&.{commands});
+
+    if (gctx.present() == .swap_chain_resized) {
         // Release old depth texture.
         gctx.destroyResource(demo.depth_texture_view);
         gctx.destroyResource(demo.depth_texture);
