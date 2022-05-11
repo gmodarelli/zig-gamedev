@@ -2,48 +2,9 @@
 
 // From: https://www.3dgep.com/forward-plus/
 // =========================================
-struct Light {
-    float4 position_ws;     // position for point lights, direction for directional lights
-    float4 radiance;        // xyz: radiance. w: intensity
-    float radius;           // only used for point lights
-    uint type;              // 0: directional, 1: point
-    float2 _padding;
-};
-
-struct Plane {
-    float3 normal;          // Plane normal
-    float distance;         // Distance to origin
-};
-
-// Four planes of a view frustum (in view space).
-// The planes are:
-// - Left,
-// - Right,
-// - Top,
-// - Botton.
-// The back and/or front planes can be computed from depth values
-// in the light culling compute shader.
-struct Frustum {
-    Plane planes[4];
-};
-
-// Compute a plane from 3 noncolinear points that form a triangle.
-// This equation assumes a right-handed (counter-clockwise winding order)
-// coordinate system to determine the direction of the plane normal.
-Plane computePlane(float3 p0, float3 p1, float3 p2) {
-    Plane plane;
-    float3 v0 = p1 - p0;
-    float3 v2 = p2 - p0;
-
-    plane.normal = normalize(cross(v0, v2));
-
-    // Compute the distance to the origin using p0.
-    plane.distance = dot(plane.normal, p0);
-
-    return plane;
-}
-
 #define BLOCK_SIZE 16
+#define NUM_LIGHTS 2000
+#define MAX_LIGHT_PER_TILE 2000
 
 struct ComputeShaderInput {
     uint3 group_id              : SV_GroupID;
@@ -89,13 +50,13 @@ void csComputeFrustum(ComputeShaderInput input)
     // as the frustum vertices.
     float4 screen_space[4];
     // Top left
-    screen_space[0] = float4(input.dispatch_thread_id.xy * BLOCK_SIZE, -1.0f, 1.0f);
+    screen_space[0] = float4(input.dispatch_thread_id.xy * BLOCK_SIZE, 1.0f, 1.0f);
     // Top right
-    screen_space[1] = float4(float2(input.dispatch_thread_id.x + 1, input.dispatch_thread_id.y) * BLOCK_SIZE, -1.0f, 1.0f);
+    screen_space[1] = float4(float2(input.dispatch_thread_id.x + 1, input.dispatch_thread_id.y) * BLOCK_SIZE, 1.0f, 1.0f);
     // Bottom left
-    screen_space[2] = float4(float2(input.dispatch_thread_id.x, input.dispatch_thread_id.y + 1) * BLOCK_SIZE, -1.0f, 1.0f);
+    screen_space[2] = float4(float2(input.dispatch_thread_id.x, input.dispatch_thread_id.y + 1) * BLOCK_SIZE, 1.0f, 1.0f);
     // Bottom right
-    screen_space[3] = float4(float2(input.dispatch_thread_id.x + 1, input.dispatch_thread_id.y + 1) * BLOCK_SIZE, -1.0f, 1.0f);
+    screen_space[3] = float4(float2(input.dispatch_thread_id.x + 1, input.dispatch_thread_id.y + 1) * BLOCK_SIZE, 1.0f, 1.0f);
 
     // Convert screen position to view position
     float3 view_space[4];
@@ -124,6 +85,123 @@ void csComputeFrustum(ComputeShaderInput input)
     {
         uint index = input.dispatch_thread_id.x + (input.dispatch_thread_id.y * dispatch_params.num_threads.x);
         frustums[index] = frustum;
+    }
+}
+
+#elif defined(PSO__COMPUTE_LIGHT_CULLING)
+
+#define root_signature \
+    "RootConstants(b0, num32BitConstants = 3), " \
+    "CBV(b1), " \
+    "CBV(b2), " \
+    "DescriptorTable(SRV(t0, numDescriptors = 3), UAV(u0, numDescriptors = 3))"
+
+ConstantBuffer<DrawRootConst> cbv_root_const : register(b0);
+ConstantBuffer<FrameConst> cvb_frame_const : register(b1);
+ConstantBuffer<DispatchParams> dispatch_params : register(b2);
+
+Texture2D<float4> depth_texture : register(t0);
+StructuredBuffer<Frustum> frustums : register(t1);
+StructuredBuffer<Light> lights : register(t2);
+RWStructuredBuffer<uint> light_index_counter : register(u0);
+RWStructuredBuffer<uint> light_index_list : register(u1);
+RWTexture2D<uint2> light_grid : register(u2);
+
+
+// Shared by a thread group
+groupshared uint u_min_depth;
+groupshared uint u_max_depth;
+groupshared Frustum group_frustum;
+
+groupshared uint light_count;
+groupshared uint light_index_start_offset;
+groupshared uint light_list[MAX_LIGHT_PER_TILE];
+
+void append_light(uint light_index) {
+    uint index; // Index into the visible lights array.
+    InterlockedAdd(light_count, 1, index);
+    if (index < MAX_LIGHT_PER_TILE) {
+        light_list[index] = light_index;
+    }
+}
+
+[RootSignature(root_signature)]
+[numthreads(BLOCK_SIZE, BLOCK_SIZE, 1)]
+void csLightCulling(ComputeShaderInput input)
+{
+    // Calculate min and max depth in threadgroup (tile)
+    int2 tex_coord = input.dispatch_thread_id.xy;
+    float fdepth = depth_texture.Load(int3(tex_coord, 0)).r;
+
+    // We can only perform atomic operations on int and uint, so we
+    // reinterpred depth as uint
+    uint udepth = asuint(fdepth);
+
+    // Avoid contention by other threads in the group.
+    if (input.group_index == 0) {
+        u_min_depth = 0xffffffff;
+        u_max_depth = 0;
+        light_count = 0;
+        group_frustum = frustums[input.group_id.x + (input.group_id.y * dispatch_params.num_thread_groups.x)];
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    InterlockedMin(u_min_depth, udepth);
+    InterlockedMax(u_max_depth, udepth);
+
+    GroupMemoryBarrierWithGroupSync();
+
+    float f_min_depth = asfloat(u_min_depth);
+    float f_max_depth = asfloat(u_max_depth);
+
+    // Convert depth values to view space.
+    float2 screen = float2(cbv_root_const.screen_width, cbv_root_const.screen_height);
+    float min_depth_vs = screenToView(cvb_frame_const.inv_proj, screen, float4(0, 0, f_min_depth, 1)).z;
+    float max_depth_vs = screenToView(cvb_frame_const.inv_proj, screen, float4(0, 0, f_max_depth, 1)).z;
+    float near_clip_vs = screenToView(cvb_frame_const.inv_proj, screen, float4(0, 0, 0, 1)).z;
+
+    // Clipping plane for minimum depth value
+    Plane min_plane = { float3(0, 0, 1), min_depth_vs };
+
+    // Cull lights
+    // Each thread in a group will cull 1 light until all lights have been culled.
+    for (uint i = input.group_index; i < NUM_LIGHTS; i += BLOCK_SIZE * BLOCK_SIZE) {
+        if (lights[i].enabled) {
+            Light light = lights[i];
+            switch (light.type) {
+                case 0: // Directional
+                    append_light(i);
+                    break;
+                case 1: // Point
+                {
+                    float3 position_vs = mul(cvb_frame_const.view, light.position_ws).xyz;
+                    Sphere sphere = { position_vs, light.radius };
+                    if (sphereInsideFrustum(sphere, group_frustum, near_clip_vs, max_depth_vs)) {
+                        if (!sphereInsidePlane(sphere, min_plane)) {
+                            append_light(i);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Wait until all threads in the group have caught up.
+    GroupMemoryBarrierWithGroupSync();
+
+    // Update global memroy with visible light buffer.
+    // First update the light grid (only thread 0 in group needs to do this)
+    if (input.group_index == 0) {
+        InterlockedAdd(light_index_counter[0], light_count, light_index_start_offset);
+        light_grid[input.group_id.xy] = uint2(light_index_start_offset, light_count);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    for (i = input.group_index; i < light_count; i += BLOCK_SIZE * BLOCK_SIZE) {
+        light_index_list[light_index_start_offset + i] = light_list[i];
     }
 }
 

@@ -28,6 +28,7 @@ const content_dir = @import("build_options").content_dir;
 const window_name = "zig-gamedev: deferred";
 const window_width = 1920;
 const window_height = 1080;
+const num_lights: u32 = 2000;
 
 const FrameConst = struct {
     view: Mat4,
@@ -89,9 +90,24 @@ const Material = struct {
     _padding1: [2]u32,
 };
 
+const Light = struct {
+    position_ws: [4]f32,        // world space position for point lights, direction for directional lights
+    radiance: [4]f32,           // xyz: radiance. w: intensity
+    radius: f32,                // only used for point lights
+    light_type: u32,            // 0: directional, 1: point
+    enabled: bool,
+    _padding: f32,
+};
+
 const Texture = struct {
     resource: zd3d12.ResourceHandle,
     persistent_descriptor: zd3d12.PersistentDescriptor,
+};
+
+const Buffer = struct {
+    resource: zd3d12.ResourceHandle,
+    srv: d3d12.CPU_DESCRIPTOR_HANDLE,
+    uav: d3d12.CPU_DESCRIPTOR_HANDLE,
 };
 
 const PersistentResource = struct {
@@ -128,7 +144,8 @@ const DeferredstateState = struct {
     rt_hdr: RenderTarget,
 
     // PSOs
-    compute_frustums_pso: zd3d12.PipelineHandle,
+    frustums_grid_pso: zd3d12.PipelineHandle,
+    light_culling_pso: zd3d12.PipelineHandle,
     z_pre_pass_opaque_pso: zd3d12.PipelineHandle,
     z_pre_pass_alpha_tested_pso: zd3d12.PipelineHandle,
     geometry_pass_opaque_pso: zd3d12.PipelineHandle,
@@ -144,9 +161,14 @@ const DeferredstateState = struct {
     index_buffer: PersistentResource,
     material_buffer: PersistentResource,
 
-    frustums_buffer: zd3d12.ResourceHandle,
-    frustums_buffer_srv: d3d12.CPU_DESCRIPTOR_HANDLE,
-    frustums_buffer_uav: d3d12.CPU_DESCRIPTOR_HANDLE,
+    // Lighting Data
+    // TODO: Create a struct to encapsulates buffer, SRV, UAV
+    lights: std.ArrayList(Light),
+    frustums_buffer: Buffer,
+    light_buffer: Buffer,
+    light_index_counter_buffer: Buffer,
+    light_index_list_buffer: Buffer,
+    light_grid_buffer: Buffer,
 
     meshes: std.ArrayList(Mesh),
     alpha_tested_mesh_indices: std.ArrayList(u32),
@@ -188,14 +210,26 @@ const DeferredstateState = struct {
         var gctx = zd3d12.GraphicsContext.init(allocator, window);
 
         // Initialize PSOs
-        // Compute Deferred Shading
-        const compute_frustums_pso = blk: {
+
+        // Generate Frustum Grid pass
+        const frustums_grid_pso = blk: {
             var pso_desc = d3d12.COMPUTE_PIPELINE_STATE_DESC.initDefault();
 
             break :blk gctx.createComputeShaderPipeline(
                 arena_allocator,
                 &pso_desc,
                 content_dir ++ "shaders/compute_frustums.cs.cso",
+            );
+        };
+
+        // Light culling pass
+        const light_culling_pso = blk: {
+            var pso_desc = d3d12.COMPUTE_PIPELINE_STATE_DESC.initDefault();
+
+            break :blk gctx.createComputeShaderPipeline(
+                arena_allocator,
+                &pso_desc,
+                content_dir ++ "shaders/light_culling.cs.cso",
             );
         };
 
@@ -340,43 +374,124 @@ const DeferredstateState = struct {
 
         var guir = GuiRenderer.init(arena_allocator, &gctx, 1, content_dir);
 
-        // Create Frustums Buffer and its SRV and UAV
-        const num_frustums: u32 = (gctx.viewport_width / 16) * (gctx.viewport_height / 16);
-        const frustums_buffer = gctx.createCommittedResource(
-            .DEFAULT,
-            d3d12.HEAP_FLAG_NONE,
-            &blk: {
-                var desc = d3d12.RESOURCE_DESC.initBuffer(num_frustums * @sizeOf([16]f32));
-                desc.Flags = d3d12.RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-                break :blk desc;
-            },
-            d3d12.RESOURCE_STATE_UNORDERED_ACCESS,
-            null,
-        ) catch |err| hrPanic(err);
+        const lighting_resources = blk: {
+            zpix.beginEvent(gctx.cmdlist, "Lighing resources creation");
+            defer zpix.endEvent(gctx.cmdlist);
 
-        const frustums_buffer_srv = gctx.allocateCpuDescriptors(.CBV_SRV_UAV, 1);
-        gctx.device.CreateShaderResourceView(
-            gctx.lookupResource(frustums_buffer).?,
-            &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(
-                0, // FirstElement
-                num_frustums, // NumElements
-                @sizeOf([16]f32), // StructureByteStride
-            ),
-            frustums_buffer_srv,
-        );
+            // Create Frustums Buffer
+            const num_frustums: u32 = (gctx.viewport_width / 16) * (gctx.viewport_height / 16);
+            const frustums_buffer = createBuffer(
+                &gctx,
+                &d3d12.RESOURCE_DESC.initBuffer(num_frustums * @sizeOf([16]f32)),
+                &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(0, num_frustums, @sizeOf([16]f32)),
+                &d3d12.UNORDERED_ACCESS_VIEW_DESC.initStructuredBuffer(0, num_frustums, @sizeOf([16]f32), 0),
+                d3d12.RESOURCE_STATE_UNORDERED_ACCESS,
+                [16]f32,
+                null,
+            );
 
-        const frustums_buffer_uav = gctx.allocateCpuDescriptors(.CBV_SRV_UAV, 1);
-        gctx.device.CreateUnorderedAccessView(
-            gctx.lookupResource(frustums_buffer).?,
-            null,
-            &d3d12.UNORDERED_ACCESS_VIEW_DESC.initStructuredBuffer(
-                0,
-                num_frustums,
-                @sizeOf([16]f32),
-                0, // CounterOffsetInBytes
-            ),
-            frustums_buffer_uav,
-        );
+            var lights = std.ArrayList(Light).init(allocator);
+
+            // Add a directional light
+            lights.append(.{
+                .position_ws = [4]f32{ 0.32139, 0.76604, -0.55667, 0.0 },
+                .radiance = [4]f32{ 14.0, 14.0, 10.0, 0.0 },
+                .radius = 0.0,
+                .light_type = 0,
+                .enabled = true,
+                ._padding = 42.0,
+            }) catch unreachable;
+
+            // Create random lights
+            // TODO: Randomly distribute them in a sphere?
+            while (lights.items.len < num_lights) {
+                lights.append(.{
+                    .position_ws = [4]f32{0.0, 0.0, 0.0, 0.0},
+                    .radiance = [4]f32{0.0, 0.0, 0.0, 0.0},
+                    .radius = 0.0,
+                    .light_type = 0,
+                    .enabled = false,
+                    ._padding = 42.0,
+                }) catch unreachable;
+            }
+
+            const light_buffer = createBuffer(
+                &gctx,
+                &d3d12.RESOURCE_DESC.initBuffer(num_lights * @sizeOf(Light)),
+                &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(0, num_lights, @sizeOf(Light)),
+                null,
+                d3d12.RESOURCE_STATE_COMMON,
+                Light,
+                &lights,
+            );
+
+            const light_index_counter_buffer = createBuffer(
+                &gctx,
+                &d3d12.RESOURCE_DESC.initBuffer(@sizeOf(u32)),
+                null,
+                &d3d12.UNORDERED_ACCESS_VIEW_DESC.initStructuredBuffer(0, 1, @sizeOf(u32), 0),
+                d3d12.RESOURCE_STATE_UNORDERED_ACCESS,
+                u32,
+                null,
+            );
+
+            const light_index_list_buffer = createBuffer(
+                &gctx,
+                &d3d12.RESOURCE_DESC.initBuffer(num_lights * @sizeOf(u32)),
+                &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(0, num_lights, @sizeOf(u32)),
+                &d3d12.UNORDERED_ACCESS_VIEW_DESC.initStructuredBuffer(0, num_lights, @sizeOf(u32), 0),
+                d3d12.RESOURCE_STATE_UNORDERED_ACCESS,
+                u32,
+                null,
+            );
+
+            const num_threads = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_width) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_height) / 16.0)), 0, 0 };
+            const num_thread_groups = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, num_threads[0]) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, num_threads[0]) / 16.0)), 0, 0 };
+
+            var srv_desc = std.mem.zeroes(d3d12.SHADER_RESOURCE_VIEW_DESC);
+            srv_desc = .{
+                .Format = .R32G32_UINT,
+                .ViewDimension = .TEXTURE2D,
+                .Shader4ComponentMapping = d3d12.DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                .u = .{
+                    .Texture2D = .{
+                        .MostDetailedMip = 0,
+                        .MipLevels = 1,
+                        .PlaneSlice = 0,
+                        .ResourceMinLODClamp = 0.0,
+                    },
+                },
+            };
+            var uav_desc = std.mem.zeroes(d3d12.UNORDERED_ACCESS_VIEW_DESC);
+            uav_desc = .{
+                .Format = .R32G32_UINT,
+                .ViewDimension = .TEXTURE2D,
+                .u = .{
+                    .Texture2D = .{
+                        .MipSlice = 0,
+                        .PlaneSlice = 0,
+                    },
+                },
+            };
+            const light_grid_buffer = createBuffer(
+                &gctx,
+                &d3d12.RESOURCE_DESC.initTex2d(.R32G32_UINT, num_thread_groups[0], num_thread_groups[1], 1),
+                &srv_desc,
+                &uav_desc,
+                d3d12.RESOURCE_STATE_UNORDERED_ACCESS,
+                [2]u32,
+                null,
+            );
+
+            break :blk .{
+                .lights = lights,
+                .frustums_buffer = frustums_buffer,
+                .light_buffer = light_buffer,
+                .light_index_counter_buffer = light_index_counter_buffer,
+                .light_index_list_buffer = light_index_list_buffer,
+                .light_grid_buffer = light_grid_buffer,
+            };
+        };
 
         // Load Sponza
         const geometry = blk: {
@@ -704,7 +819,8 @@ const DeferredstateState = struct {
             .rt2 = rt2,
             .rt_hdr = rt_hdr,
 
-            .compute_frustums_pso = compute_frustums_pso,
+            .frustums_grid_pso = frustums_grid_pso,
+            .light_culling_pso = light_culling_pso,
             .z_pre_pass_opaque_pso = z_pre_pass_psos.opaque_pso,
             .z_pre_pass_alpha_tested_pso = z_pre_pass_psos.alpha_tested_pso,
             .geometry_pass_opaque_pso = geometry_pass_psos.opaque_pso,
@@ -725,9 +841,12 @@ const DeferredstateState = struct {
             .material_buffer = geometry.material_buffer,
 
             .need_to_compute_frustrums = true,
-            .frustums_buffer = frustums_buffer,
-            .frustums_buffer_srv = frustums_buffer_srv,
-            .frustums_buffer_uav = frustums_buffer_uav,
+            .lights = lighting_resources.lights,
+            .frustums_buffer = lighting_resources.frustums_buffer,
+            .light_buffer = lighting_resources.light_buffer,
+            .light_index_counter_buffer = lighting_resources.light_index_counter_buffer,
+            .light_index_list_buffer = lighting_resources.light_index_list_buffer,
+            .light_grid_buffer = lighting_resources.light_grid_buffer,
 
             .view_mode = 2,
 
@@ -751,6 +870,8 @@ const DeferredstateState = struct {
         state.guir.deinit(&state.gctx);
         state.gctx.deinit(allocator);
         common.deinitWindow(allocator);
+
+        state.lights.deinit();
 
         state.meshes.deinit();
         state.materials.deinit();
@@ -871,13 +992,16 @@ const DeferredstateState = struct {
 
             state.need_to_compute_frustrums = false;
 
+            const num_threads = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_width) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_height) / 16.0)), 0, 0 };
+            const num_thread_groups = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, num_threads[0]) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, num_threads[0]) / 16.0)), 0, 0 };
+
             const dispatch_params = gctx.allocateUploadMemory(DispatchParams, 1);
             dispatch_params.cpu_slice[0] = .{
-                .num_thread_groups = [4]u32{ 0, 0, 0, 0 },
-                .num_threads = [4]u32{ gctx.viewport_width / 16, gctx.viewport_height / 16, 0, 0 },
+                .num_thread_groups = num_thread_groups,
+                .num_threads = num_threads,
             };
 
-            gctx.setCurrentPipeline(state.compute_frustums_pso);
+            gctx.setCurrentPipeline(state.frustums_grid_pso);
             gctx.cmdlist.SetComputeRoot32BitConstants(
                 0,
                 2, 
@@ -888,7 +1012,7 @@ const DeferredstateState = struct {
             gctx.cmdlist.SetComputeRootConstantBufferView(2, dispatch_params.gpu_base);
             gctx.cmdlist.SetComputeRootDescriptorTable(
                 3,
-                gctx.copyDescriptorsToGpuHeap(1, state.frustums_buffer_uav),
+                gctx.copyDescriptorsToGpuHeap(1, state.frustums_buffer.uav),
             );
             gctx.cmdlist.Dispatch(gctx.viewport_width / 16, gctx.viewport_height / 16, 1);
         }
@@ -947,6 +1071,11 @@ const DeferredstateState = struct {
                     gctx.cmdlist.DrawInstanced(mesh.num_indices, 1, 0, 0);
                 }
             }
+        }
+
+        // Light Culling
+        {
+
         }
 
         // Geometry Pass
@@ -1118,6 +1247,74 @@ const DeferredstateState = struct {
         gctx.flushResourceBarriers();
 
         gctx.endFrame();
+    }
+
+    fn createBuffer(
+        gctx: *zd3d12.GraphicsContext,
+        resource_desc: *d3d12.RESOURCE_DESC,
+        optional_srv_desc: ?*d3d12.SHADER_RESOURCE_VIEW_DESC,
+        optional_uav_desc: ?*d3d12.UNORDERED_ACCESS_VIEW_DESC,
+        state_after: d3d12.RESOURCE_STATES,
+        comptime T: type,
+        optional_data: ?*std.ArrayList(T),
+    ) Buffer {
+        const initial_state: d3d12.RESOURCE_STATES = if (optional_data) |_| d3d12.RESOURCE_STATE_COPY_DEST else state_after;
+
+        if (optional_uav_desc) |_| {
+            resource_desc.Flags |= d3d12.RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        }
+
+        const resource = gctx.createCommittedResource(
+            .DEFAULT,
+            d3d12.HEAP_FLAG_NONE,
+            resource_desc,
+            initial_state,
+            null,
+        ) catch |err| hrPanic(err);
+
+        var srv: d3d12.CPU_DESCRIPTOR_HANDLE = undefined;
+        if (optional_srv_desc) |srv_desc| {
+            srv = gctx.allocateCpuDescriptors(.CBV_SRV_UAV, 1);
+            gctx.device.CreateShaderResourceView(
+                gctx.lookupResource(resource).?,
+                srv_desc,
+                srv,
+            );
+        }
+
+        var uav: d3d12.CPU_DESCRIPTOR_HANDLE = undefined;
+        if (optional_uav_desc) |uav_desc| {
+            uav = gctx.allocateCpuDescriptors(.CBV_SRV_UAV, 1);
+            gctx.device.CreateUnorderedAccessView(
+                gctx.lookupResource(resource).?,
+                null,
+                uav_desc,
+                uav,
+            );
+        }
+
+        if (optional_data) |data| {
+            const upload = gctx.allocateUploadBufferRegion(T, @intCast(u32, data.items.len));
+            for (data.items) |element, i| {
+                upload.cpu_slice[i] = element;
+            }
+            gctx.cmdlist.CopyBufferRegion(
+                gctx.lookupResource(resource).?,
+                0,
+                upload.buffer,
+                upload.buffer_offset,
+                upload.cpu_slice.len * @sizeOf(@TypeOf(upload.cpu_slice[0])),
+            );
+
+            gctx.addTransitionBarrier(resource, state_after);
+            gctx.flushResourceBarriers();
+        }
+
+        return Buffer{
+            .resource = resource,
+            .srv = srv,
+            .uav = uav,
+        };
     }
 
     fn createPersistentResource(
