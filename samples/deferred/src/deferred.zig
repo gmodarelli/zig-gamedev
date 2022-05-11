@@ -456,8 +456,7 @@ const DeferredstateState = struct {
                 null,
             );
 
-            const num_threads = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_width) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_height) / 16.0)), 0, 0 };
-            const num_thread_groups = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, num_threads[0]) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, num_threads[0]) / 16.0)), 0, 0 };
+            const num_thread_groups = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_width) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_height) / 16.0)), 0, 0 };
 
             var srv_desc = std.mem.zeroes(d3d12.SHADER_RESOURCE_VIEW_DESC);
             srv_desc = .{
@@ -997,8 +996,9 @@ const DeferredstateState = struct {
             .material_buffer_index = state.material_buffer.persistent_descriptor.index,
         };
 
-        const num_threads = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_width) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_height) / 16.0)), 0, 0 };
-        const num_thread_groups = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, num_threads[0]) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, num_threads[0]) / 16.0)), 0, 0 };
+        // Compute Frustum Grid
+        const num_thread_groups = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_width) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_height) / 16.0)), 0, 0 };
+        const num_threads = [4]u32{ num_thread_groups[0] * 16, num_thread_groups[0] * 16, 0, 0 };
 
         const dispatch_params = gctx.allocateUploadMemory(DispatchParams, 1);
         dispatch_params.cpu_slice[0] = .{
@@ -1006,7 +1006,6 @@ const DeferredstateState = struct {
             .num_threads = num_threads,
         };
 
-        // Compute Frustum Grid
         if (state.need_to_compute_frustrums) {
             zpix.beginEvent(gctx.cmdlist, "Compute Frustum Grid");
             defer zpix.endEvent(gctx.cmdlist);
@@ -1026,7 +1025,7 @@ const DeferredstateState = struct {
                 3,
                 gctx.copyDescriptorsToGpuHeap(1, state.frustums_buffer.uav),
             );
-            gctx.cmdlist.Dispatch(num_threads[0], num_threads[1], 1);
+            gctx.cmdlist.Dispatch(num_thread_groups[0], num_thread_groups[1], 1);
         }
 
         // Z-PrePass
@@ -1152,7 +1151,7 @@ const DeferredstateState = struct {
                 break :blk table;
             });
 
-            gctx.cmdlist.Dispatch(num_threads[0], num_threads[1], 1);
+            gctx.cmdlist.Dispatch(num_thread_groups[0], num_thread_groups[1], 1);
         }
 
         // Geometry Pass
@@ -1250,6 +1249,8 @@ const DeferredstateState = struct {
             gctx.addTransitionBarrier(state.rt0.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             gctx.addTransitionBarrier(state.rt1.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             gctx.addTransitionBarrier(state.rt2.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(state.light_index_list_buffer.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(state.light_grid_buffer.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             gctx.flushResourceBarriers();
 
             gctx.setCurrentPipeline(state.compute_shading_pso);
@@ -1266,11 +1267,14 @@ const DeferredstateState = struct {
                 _ = gctx.copyDescriptorsToGpuHeap(1, state.rt0.srv);
                 _ = gctx.copyDescriptorsToGpuHeap(1, state.rt1.srv);
                 _ = gctx.copyDescriptorsToGpuHeap(1, state.rt2.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.light_index_list_buffer.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.light_grid_buffer.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.light_buffer.srv);
                 _ = gctx.copyDescriptorsToGpuHeap(1, state.rt_hdr.uav);
                 break :blk table;
             });
 
-            gctx.cmdlist.Dispatch(gctx.viewport_width / 16, gctx.viewport_height / 16, 1);
+            gctx.cmdlist.Dispatch(num_thread_groups[0], num_thread_groups[1], 1);
         }
 
         const back_buffer = gctx.getBackBuffer();

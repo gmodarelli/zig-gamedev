@@ -158,7 +158,7 @@ void psGeometryPass(
 #define root_signature \
     "RootConstants(b0, num32BitConstants = 2), " \
     "CBV(b1), " \
-    "DescriptorTable(SRV(t0, numDescriptors = 4), UAV(u0, numDescriptors = 1))"
+    "DescriptorTable(SRV(t0, numDescriptors = 7), UAV(u0, numDescriptors = 1))"
 
 struct DrawRootConst {
     uint screen_width;
@@ -172,6 +172,9 @@ Texture2D<float4> depth_texture : register(t0);
 Texture2D<float4> gbuffer0 : register(t1);
 Texture2D<float4> gbuffer1 : register(t2);
 Texture2D<float4> gbuffer2 : register(t3);
+StructuredBuffer<uint> light_index_list : register(t4);
+Texture2D<uint2> light_grid : register(t5);
+StructuredBuffer<Light> lights : register(t6);
 RWTexture2D<float4> output : register(u0);
 
 [RootSignature(root_signature)]
@@ -201,11 +204,20 @@ void csDeferredShading(uint3 dispatch_id : SV_DispatchThreadID) {
     pbr_input.metallic = data.r;
     pbr_input.roughness = data.g;
 
-    const float3 light_direction = float3(0.32139, 0.76604, -0.55667);
-    const float3 light_radiance = float3(14.0, 14.0, 10.0);
+    // Get the index of the current pixel in the light grid
+    uint2 tile_index = uint2(floor(dispatch_id.xy / BLOCK_SIZE));
+    // Get the start position and offset of the light in the light index list
+    uint start_offset = light_grid[tile_index].x;
+    uint light_count = light_grid[tile_index].y;
 
-    float3 lighting = calculateLighting(pbr_input, base_color, light_direction, light_radiance);
+    float3 lighting = 0;
+    for (uint i = 0; i < light_count; i++) {
+        uint light_index = light_index_list[start_offset + i];
+        Light light = lights[light_index];
+        lighting += calculateLighting(pbr_input, base_color, light);
+    }
 
+    // output[dispatch_id.xy] = float4(lighting, 1.0);
     output[dispatch_id.xy] = float4(lighting, 1.0);
 }
 

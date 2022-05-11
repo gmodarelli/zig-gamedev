@@ -1,3 +1,7 @@
+#define BLOCK_SIZE 16
+#define NUM_LIGHTS 2000
+#define MAX_LIGHT_PER_TILE 2000
+
 struct Material {
     float3 base_color;
     float roughness;

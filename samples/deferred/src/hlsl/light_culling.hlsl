@@ -2,10 +2,6 @@
 
 // From: https://www.3dgep.com/forward-plus/
 // =========================================
-#define BLOCK_SIZE 16
-#define NUM_LIGHTS 2000
-#define MAX_LIGHT_PER_TILE 2000
-
 struct ComputeShaderInput {
     uint3 group_id              : SV_GroupID;
     uint3 group_thread_id       : SV_GroupThreadID;

@@ -32,13 +32,19 @@ struct PBRInput {
     float roughness;
 };
 
-float3 calculateLighting(PBRInput pbr_input, float3 base_color, float3 l, float3 radiance) {
+struct LightingResult {
+    float3 diffuse;
+    float3 specular;
+};
+
+float3 calculateLighting(PBRInput pbr_input, float3 base_color, Light light) {
+    // FIXME: Assuming always directiona light!!!
+    float3 l = light.position_ws.xyz;
+
     const float n_dot_v = saturate(dot(pbr_input.n, pbr_input.v));
 
     float3 f0 = float3(0.04, 0.04, 0.04);
     f0 = lerp(f0, base_color, pbr_input.metallic);
-
-    float3 lo = 0.0;
 
     // Light contribution
     float3 h = normalize(l + pbr_input.v);
@@ -51,7 +57,6 @@ float3 calculateLighting(PBRInput pbr_input, float3 base_color, float3 l, float3
 
     float3 specular = (nd * g * f) / max(4.0 * n_dot_v * n_dot_l, 0.001);
     float3 kd = (1.0 - f) * (1.0 - pbr_input.metallic);
-    lo += (kd * (base_color / PI) + specular) * radiance * n_dot_l;
 
-    return lo;
+    return (kd * (base_color / PI) + specular) * light.radiance.rgb * n_dot_l;
 }
