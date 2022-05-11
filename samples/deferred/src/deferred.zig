@@ -145,6 +145,7 @@ const DeferredstateState = struct {
 
     // PSOs
     frustums_grid_pso: zd3d12.PipelineHandle,
+    clear_buffers_pso: zd3d12.PipelineHandle,
     light_culling_pso: zd3d12.PipelineHandle,
     z_pre_pass_opaque_pso: zd3d12.PipelineHandle,
     z_pre_pass_alpha_tested_pso: zd3d12.PipelineHandle,
@@ -223,6 +224,16 @@ const DeferredstateState = struct {
         };
 
         // Light culling pass
+        const clear_buffers_pso = blk: {
+            var pso_desc = d3d12.COMPUTE_PIPELINE_STATE_DESC.initDefault();
+
+            break :blk gctx.createComputeShaderPipeline(
+                arena_allocator,
+                &pso_desc,
+                content_dir ++ "shaders/clear_buffers.cs.cso",
+            );
+        };
+
         const light_culling_pso = blk: {
             var pso_desc = d3d12.COMPUTE_PIPELINE_STATE_DESC.initDefault();
 
@@ -820,6 +831,7 @@ const DeferredstateState = struct {
             .rt_hdr = rt_hdr,
 
             .frustums_grid_pso = frustums_grid_pso,
+            .clear_buffers_pso = clear_buffers_pso,
             .light_culling_pso = light_culling_pso,
             .z_pre_pass_opaque_pso = z_pre_pass_psos.opaque_pso,
             .z_pre_pass_alpha_tested_pso = z_pre_pass_psos.alpha_tested_pso,
@@ -985,21 +997,21 @@ const DeferredstateState = struct {
             .material_buffer_index = state.material_buffer.persistent_descriptor.index,
         };
 
+        const num_threads = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_width) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_height) / 16.0)), 0, 0 };
+        const num_thread_groups = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, num_threads[0]) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, num_threads[0]) / 16.0)), 0, 0 };
+
+        const dispatch_params = gctx.allocateUploadMemory(DispatchParams, 1);
+        dispatch_params.cpu_slice[0] = .{
+            .num_thread_groups = num_thread_groups,
+            .num_threads = num_threads,
+        };
+
         // Compute Frustum Grid
         if (state.need_to_compute_frustrums) {
             zpix.beginEvent(gctx.cmdlist, "Compute Frustum Grid");
             defer zpix.endEvent(gctx.cmdlist);
 
             state.need_to_compute_frustrums = false;
-
-            const num_threads = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_width) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_height) / 16.0)), 0, 0 };
-            const num_thread_groups = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, num_threads[0]) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, num_threads[0]) / 16.0)), 0, 0 };
-
-            const dispatch_params = gctx.allocateUploadMemory(DispatchParams, 1);
-            dispatch_params.cpu_slice[0] = .{
-                .num_thread_groups = num_thread_groups,
-                .num_threads = num_threads,
-            };
 
             gctx.setCurrentPipeline(state.frustums_grid_pso);
             gctx.cmdlist.SetComputeRoot32BitConstants(
@@ -1014,7 +1026,7 @@ const DeferredstateState = struct {
                 3,
                 gctx.copyDescriptorsToGpuHeap(1, state.frustums_buffer.uav),
             );
-            gctx.cmdlist.Dispatch(gctx.viewport_width / 16, gctx.viewport_height / 16, 1);
+            gctx.cmdlist.Dispatch(num_threads[0], num_threads[1], 1);
         }
 
         // Z-PrePass
@@ -1075,7 +1087,72 @@ const DeferredstateState = struct {
 
         // Light Culling
         {
+            zpix.beginEvent(gctx.cmdlist, "Light Culling");
+            defer zpix.endEvent(gctx.cmdlist);
 
+            // Clear buffers
+            {
+                zpix.beginEvent(gctx.cmdlist, "Clear buffers");
+                defer zpix.endEvent(gctx.cmdlist);
+
+                gctx.setCurrentPipeline(state.clear_buffers_pso);
+
+                // Root Constants
+                gctx.cmdlist.SetComputeRoot32BitConstants(
+                    0,
+                    2, 
+                    &.{ gctx.viewport_width, gctx.viewport_height },
+                    0,
+                );
+
+                // Frame Constants
+                gctx.cmdlist.SetComputeRootConstantBufferView(1, frame_const_mem.gpu_base);
+
+                // Dispatch Params
+                gctx.cmdlist.SetComputeRootConstantBufferView(2, dispatch_params.gpu_base);
+
+                gctx.cmdlist.SetComputeRootDescriptorTable(3, blk: {
+                    const table = gctx.copyDescriptorsToGpuHeap(1, state.light_index_counter_buffer.uav);
+                    _ = gctx.copyDescriptorsToGpuHeap(1, state.light_index_list_buffer.uav);
+                    _ = gctx.copyDescriptorsToGpuHeap(1, state.light_grid_buffer.uav);
+                    break :blk table;
+                });
+
+                gctx.cmdlist.Dispatch(1, 1, 1);
+            }
+
+            // Transition the depth buffer from Depth attachment to "Texture" attachment
+            // TODO: Add more barriers for other buffers
+            gctx.addTransitionBarrier(state.depth_texture, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.flushResourceBarriers();
+
+            gctx.setCurrentPipeline(state.light_culling_pso);
+
+            // Root Constants
+            gctx.cmdlist.SetComputeRoot32BitConstants(
+                0,
+                2, 
+                &.{ gctx.viewport_width, gctx.viewport_height },
+                0,
+            );
+
+            // Frame Constants
+            gctx.cmdlist.SetComputeRootConstantBufferView(1, frame_const_mem.gpu_base);
+
+            // Dispatch Params
+            gctx.cmdlist.SetComputeRootConstantBufferView(2, dispatch_params.gpu_base);
+
+            gctx.cmdlist.SetComputeRootDescriptorTable(3, blk: {
+                const table = gctx.copyDescriptorsToGpuHeap(1, state.depth_texture_srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.frustums_buffer.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.light_buffer.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.light_index_counter_buffer.uav);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.light_index_list_buffer.uav);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.light_grid_buffer.uav);
+                break :blk table;
+            });
+
+            gctx.cmdlist.Dispatch(num_threads[0], num_threads[1], 1);
         }
 
         // Geometry Pass
@@ -1083,6 +1160,7 @@ const DeferredstateState = struct {
             zpix.beginEvent(gctx.cmdlist, "Geometry Pass");
             defer zpix.endEvent(gctx.cmdlist);
 
+            gctx.addTransitionBarrier(state.depth_texture, d3d12.RESOURCE_STATE_DEPTH_WRITE);
             // Transition the render targets to render target
             gctx.addTransitionBarrier(state.rt0.resource, d3d12.RESOURCE_STATE_RENDER_TARGET);
             gctx.addTransitionBarrier(state.rt1.resource, d3d12.RESOURCE_STATE_RENDER_TARGET);

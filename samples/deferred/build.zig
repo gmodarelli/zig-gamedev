@@ -157,6 +157,15 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
 
     dxc_command = makeDxcCmd(
         "src/hlsl/light_culling.hlsl",
+        "csClearBuffers",
+        "clear_buffers.cs.cso",
+        "cs",
+        "PSO__COMPUTE_CLEAR_BUFFERS",
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "src/hlsl/light_culling.hlsl",
         "csLightCulling",
         "light_culling.cs.cso",
         "cs",

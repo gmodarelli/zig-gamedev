@@ -21,7 +21,6 @@ struct DispatchParams {
 struct DrawRootConst {
     uint screen_width;
     uint screen_height;
-    uint frustums_buffer_index;
 };
 
 #if defined(PSO__LIGHTING_COMPUTE_FRUSTUMS)
@@ -88,10 +87,43 @@ void csComputeFrustum(ComputeShaderInput input)
     }
 }
 
+#elif defined(PSO__COMPUTE_CLEAR_BUFFERS)
+
+#define root_signature \
+    "RootConstants(b0, num32BitConstants = 2), " \
+    "CBV(b1), " \
+    "CBV(b2), " \
+    "DescriptorTable(UAV(u0, numDescriptors = 3))"
+
+ConstantBuffer<DrawRootConst> cbv_root_const : register(b0);
+ConstantBuffer<FrameConst> cvb_frame_const : register(b1);
+ConstantBuffer<DispatchParams> dispatch_params : register(b2);
+
+RWStructuredBuffer<uint> light_index_counter : register(u0);
+RWStructuredBuffer<uint> light_index_list : register(u1);
+RWTexture2D<uint2> light_grid : register(u2);
+
+[RootSignature(root_signature)]
+[numthreads(1, 1, 1)]
+void csClearBuffers(ComputeShaderInput input)
+{
+    light_index_counter[0] = 0;
+
+    for (uint i = 0; i < NUM_LIGHTS; i++) {
+        light_index_list[i] = 0;
+    }
+
+    for (uint x = 0; x < dispatch_params.num_thread_groups.x; x++) {
+        for (uint y = 0; y < dispatch_params.num_thread_groups.y; y++) {
+            light_grid[uint2(x, y)] = uint2(0, 0);
+        }
+    }
+}
+
 #elif defined(PSO__COMPUTE_LIGHT_CULLING)
 
 #define root_signature \
-    "RootConstants(b0, num32BitConstants = 3), " \
+    "RootConstants(b0, num32BitConstants = 2), " \
     "CBV(b1), " \
     "CBV(b2), " \
     "DescriptorTable(SRV(t0, numDescriptors = 3), UAV(u0, numDescriptors = 3))"
