@@ -28,15 +28,17 @@ struct FrameConst {
     uint tangent_buffer_index;
     uint index_buffer_index;
     uint material_buffer_index;
+    uint transform_buffer_index;
 };
 
 struct DrawConst {
-    float4x4 object_to_world;
     uint material_index;
+    uint transform_index;
 };
 
 struct Light {
     float4 position_ws;     // position for point lights, direction for directional lights
+    float4 position_vs;     // position for point lights, direction for directional lights
     float4 radiance;        // xyz: radiance. w: intensity
     float radius;           // only used for point lights
     uint type;              // 0: directional, 1: point
@@ -52,18 +54,6 @@ struct Sphere {
 struct Plane {
     float3 normal;          // Plane normal
     float distance;         // Distance to origin
-};
-
-// Four planes of a view frustum (in view space).
-// The planes are:
-// - Left,
-// - Right,
-// - Top,
-// - Botton.
-// The back and/or front planes can be computed from depth values
-// in the light culling compute shader.
-struct Frustum {
-    Plane planes[4];
 };
 
 // Compute a plane from 3 noncolinear points that form a triangle.
@@ -82,30 +72,21 @@ Plane computePlane(float3 p0, float3 p1, float3 p2) {
     return plane;
 }
 
-// Check to see if a sphere is fully behind (inside the negative half space of) a plane.
-// Source: Real-time collision detection, Christer Ericson (2005)
-bool sphereInsidePlane(Sphere sphere, Plane plane) {
-    return dot(plane.normal, sphere.center) - plane.distance < -sphere.radius;
-}
-
-// Check to see if a light is partially contained within the frustum.
-bool sphereInsideFrustum(Sphere sphere, Frustum frustum, float z_near, float z_far) {
-    // First check depth
-    if (sphere.center.z - sphere.radius > z_far || sphere.center.z + sphere.radius < z_near)
-        return false;
-
-    // Then check frustum planes
-    for (int i = 0; i < 4; i++) {
-        if (sphereInsidePlane(sphere, frustum.planes[i]))
-            return false;
-    }
-
-    return true;
-}
+// Four planes of a view frustum (in view space).
+// The planes are:
+// - Left,
+// - Right,
+// - Top,
+// - Botton.
+// The back and/or front planes can be computed from depth values
+// in the light culling compute shader.
+struct Frustum {
+    Plane planes[4];
+};
 
 float4 clipToView(float4x4 inv_proj, float4 clip_position) {
     // View space position
-    float4 view = mul(clip_position, inv_proj);
+    float4 view = mul(inv_proj, clip_position);
     // Perspective projection
     view = view / view.w;
 
@@ -116,7 +97,53 @@ float4 screenToView(float4x4 inv_proj, float2 screen_dimensions, float4 screen_p
     // Convert to normalized texture coordinates
     float2 tex_coords = screen_position.xy / screen_dimensions;
     // Convert to clip space
-    float4 clip_position = float4(float2(tex_coords.x, 1.0f - tex_coords.y) * 2.0f - 1.0f, 1.0f, 1.0f);
+    float4 clip_position = float4(float2(tex_coords.x, 1.0f - tex_coords.y) * 2.0f - 1.0f, screen_position.z, screen_position.w);
 
     return clipToView(inv_proj, clip_position);
+}
+
+// Check to see if a sphere is fully behind (inside the negative half space of) a plane.
+// Source: Real-time collision detection, Christer Ericson (2005)
+bool sphereInsidePlane(Sphere sphere, Plane plane) {
+    return dot(plane.normal, sphere.center) - plane.distance < -sphere.radius;
+}
+
+// Check to see if a light is partially contained within the frustum.
+bool sphereInsideFrustum(Sphere sphere, Frustum frustum, float z_near, float z_far) {
+    bool result = true;
+
+    // Unrolled based on Wicked Engine implementation
+	result = ((sphere.center.z + sphere.radius < z_near || sphere.center.z - sphere.radius > z_far) ? false : result);
+	result = ((sphereInsidePlane(sphere, frustum.planes[0])) ? false : result);
+	result = ((sphereInsidePlane(sphere, frustum.planes[1])) ? false : result);
+	result = ((sphereInsidePlane(sphere, frustum.planes[2])) ? false : result);
+	result = ((sphereInsidePlane(sphere, frustum.planes[3])) ? false : result);
+
+	return result;
+}
+
+// https://github.com/TheRealMJP/BakingLab/blob/master/BakingLab/ToneMapping.hlsl
+
+float3 linearTosRGB(float3 color) {
+    float3 x = color * 12.92f;
+    float3 y = 1.055f * pow(saturate(color), 1.0f / 2.4f) - 0.055f;
+
+    float3 clr = color;
+    clr.r = color.r < 0.0031308f ? x.r : y.r;
+    clr.g = color.g < 0.0031308f ? x.g : y.g;
+    clr.b = color.b < 0.0031308f ? x.b : y.b;
+
+    return clr;
+}
+
+float3 sRGBToLinear(in float3 color) {
+    float3 x = color / 12.92f;
+    float3 y = pow(max((color + 0.055f) / 1.055f, 0.0f), 2.4f);
+
+    float3 clr = color;
+    clr.r = color.r <= 0.04045f ? x.r : y.r;
+    clr.g = color.g <= 0.04045f ? x.g : y.g;
+    clr.b = color.b <= 0.04045f ? x.b : y.b;
+
+    return clr;
 }

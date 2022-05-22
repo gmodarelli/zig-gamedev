@@ -10,8 +10,8 @@ struct ComputeShaderInput {
 };
 
 struct DispatchParams {
-    uint4 num_thread_groups;
-    uint4 num_threads;
+    uint3 num_thread_groups;
+    uint3 num_threads;
 };
 
 struct DrawRootConst {
@@ -57,23 +57,19 @@ void csComputeFrustum(ComputeShaderInput input)
     float3 view_space[4];
     for (int i = 0; i < 4; i++)
     {
-        float2 tex_coord = screen_space[i].xy / float2(cbv_root_const.screen_width, cbv_root_const.screen_height);
-        float4 clip = float4(float2(tex_coord.x, 1.0f - tex_coord.y) * 2.0f - 1.0f, screen_space[i].z, screen_space[i].w);
-        float4 view = mul(clip, cvb_frame_const.inv_proj);
-        view /= view.w;
-        view_space[i] = view.xyz;
+        view_space[i] = screenToView(cvb_frame_const.inv_proj, float2(cbv_root_const.screen_width, cbv_root_const.screen_width), screen_space[i]).xyz;
     }
 
     // Build the frustum planes from the view space points
     Frustum frustum;
     // Left plane
-    frustum.planes[0] = computePlane(eye_position, view_space[2], view_space[0]);
+    frustum.planes[0] = computePlane(view_space[2], eye_position, view_space[0]);
     // Right plane
-    frustum.planes[1] = computePlane(eye_position, view_space[1], view_space[3]);
+    frustum.planes[1] = computePlane(view_space[1], eye_position, view_space[3]);
     // Top plane
-    frustum.planes[2] = computePlane(eye_position, view_space[0], view_space[1]);
+    frustum.planes[2] = computePlane(view_space[0], eye_position, view_space[1]);
     // Bottom plane
-    frustum.planes[3] = computePlane(eye_position, view_space[3], view_space[2]);
+    frustum.planes[3] = computePlane(view_space[3], eye_position, view_space[2]);
 
     // Store the computed frustum in global memory
     if (input.dispatch_thread_id.x < dispatch_params.num_threads.x && input.dispatch_thread_id.y < dispatch_params.num_threads.y)
@@ -113,6 +109,29 @@ void csClearBuffers(ComputeShaderInput input)
         for (uint y = 0; y < dispatch_params.num_thread_groups.y; y++) {
             light_grid[uint2(x, y)] = uint2(0, 0);
         }
+    }
+}
+
+#elif defined(PSO__COMPUTE_UPDATE_LIGHTS)
+
+#define root_signature \
+    "RootConstants(b0, num32BitConstants = 2), " \
+    "CBV(b1), " \
+    "CBV(b2), " \
+    "DescriptorTable(UAV(u0, numDescriptors = 1))"
+
+ConstantBuffer<DrawRootConst> cbv_root_const : register(b0);
+ConstantBuffer<FrameConst> cvb_frame_const : register(b1);
+ConstantBuffer<DispatchParams> dispatch_params : register(b2);
+
+RWStructuredBuffer<Light> lights : register(u0);
+
+[RootSignature(root_signature)]
+[numthreads(1, 1, 1)]
+void csUpdateLights(ComputeShaderInput input)
+{
+    for (uint i = 0; i < NUM_LIGHTS; i++) {
+        lights[i].position_vs = mul(lights[i].position_ws, cvb_frame_const.view);
     }
 }
 
@@ -187,10 +206,10 @@ void csLightCulling(ComputeShaderInput input)
     float2 screen = float2(cbv_root_const.screen_width, cbv_root_const.screen_height);
     float min_depth_vs = screenToView(cvb_frame_const.inv_proj, screen, float4(0, 0, f_min_depth, 1)).z;
     float max_depth_vs = screenToView(cvb_frame_const.inv_proj, screen, float4(0, 0, f_max_depth, 1)).z;
-    float near_clip_vs = screenToView(cvb_frame_const.inv_proj, screen, float4(0, 0, 0, 1)).z;
+    float near_clip_vs = screenToView(cvb_frame_const.inv_proj, screen, float4(0, 0, -1, 1)).z;
 
     // Clipping plane for minimum depth value
-    Plane min_plane = { float3(0, 0, 1), min_depth_vs };
+    Plane min_plane = { float3(0, 0, -1), min_depth_vs };
 
     // Cull lights
     // Each thread in a group will cull 1 light until all lights have been culled.
@@ -203,8 +222,8 @@ void csLightCulling(ComputeShaderInput input)
                     break;
                 case 1: // Point
                 {
-                    float3 position_vs = mul(cvb_frame_const.view, light.position_ws).xyz;
-                    Sphere sphere = { position_vs, light.radius };
+                    // append_light(i);
+                    Sphere sphere = { light.position_vs.xyz, light.radius };
                     if (sphereInsideFrustum(sphere, group_frustum, near_clip_vs, max_depth_vs)) {
                         if (!sphereInsidePlane(sphere, min_plane)) {
                             append_light(i);

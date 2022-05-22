@@ -23,7 +23,7 @@ pub fn build(b: *std.build.Builder, options: Options) *std.build.LibExeObjStep {
     exe.setTarget(options.target);
     exe.addOptions("build_options", exe_options);
 
-    const dxc_step = buildShaders(b);
+    const dxc_step = buildShaders(b, options.enable_dx_debug);
     const install_content_step = b.addInstallDirectory(.{
         .source_dir = thisDir() ++ "/" ++ content_dir,
         .install_dir = .{ .custom = "" },
@@ -54,7 +54,7 @@ pub fn build(b: *std.build.Builder, options: Options) *std.build.LibExeObjStep {
     return exe;
 }
 
-fn buildShaders(b: *std.build.Builder) *std.build.Step {
+fn buildShaders(b: *std.build.Builder, debug: bool) *std.build.Step {
     const dxc_step = b.step("deferred-dxc", "Build shaders for 'deferred' demo");
 
     var dxc_command = makeDxcCmd(
@@ -63,6 +63,7 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "imgui.vs.cso",
         "vs",
         "PSO__IMGUI",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
     dxc_command = makeDxcCmd(
@@ -71,6 +72,7 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "imgui.ps.cso",
         "ps",
         "PSO__IMGUI",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -80,6 +82,7 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "generate_mipmaps.cs.cso",
         "cs",
         "PSO__GENERATE_MIPMAPS",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -89,6 +92,7 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "z_pre_pass.vs.cso",
         "vs",
         "PSO__Z_PRE_PASS",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -98,6 +102,7 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "z_pre_pass_opaque.ps.cso",
         "ps",
         "PSO__Z_PRE_PASS",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -107,6 +112,7 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "z_pre_pass_alpha_tested.ps.cso",
         "ps",
         "PSO__Z_PRE_PASS_ALPHA_TESTED",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -116,6 +122,7 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "geometry_pass.vs.cso",
         "vs",
         "PSO__GEOMETRY_PASS",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -125,6 +132,7 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "geometry_pass_opaque.ps.cso",
         "ps",
         "PSO__GEOMETRY_PASS",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -134,6 +142,7 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "geometry_pass_alpha_tested.ps.cso",
         "ps",
         "PSO__GEOMETRY_PASS_ALPHA_TESTED",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -143,6 +152,7 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "deferred_shading.cs.cso",
         "cs",
         "PSO__DEFERRED_COMPUTE_SHADING",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -152,6 +162,7 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "compute_frustums.cs.cso",
         "cs",
         "PSO__LIGHTING_COMPUTE_FRUSTUMS",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -161,6 +172,17 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "clear_buffers.cs.cso",
         "cs",
         "PSO__COMPUTE_CLEAR_BUFFERS",
+        debug,
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "src/hlsl/light_culling.hlsl",
+        "csUpdateLights",
+        "update_lights.cs.cso",
+        "cs",
+        "PSO__COMPUTE_UPDATE_LIGHTS",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -170,24 +192,27 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
         "light_culling.cs.cso",
         "cs",
         "PSO__COMPUTE_LIGHT_CULLING",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
     dxc_command = makeDxcCmd(
         "src/hlsl/deferred.hlsl",
         "vsDebugView",
-        "debug_view.vs.cso",
+        "final_blit.vs.cso",
         "vs",
-        "PSO__DEBUG_VIEW",
+        "PSO__FINAL_BLIT",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
     dxc_command = makeDxcCmd(
         "src/hlsl/deferred.hlsl",
         "psDebugView",
-        "debug_view.ps.cso",
+        "final_blit.ps.cso",
         "ps",
-        "PSO__DEBUG_VIEW",
+        "PSO__FINAL_BLIT",
+        debug,
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
@@ -200,10 +225,11 @@ fn makeDxcCmd(
     comptime output_filename: []const u8,
     comptime profile: []const u8,
     comptime define: []const u8,
-) [9][]const u8 {
+    debug: bool,
+) [11][]const u8 {
     const shader_ver = "6_6";
     const shader_dir = thisDir() ++ "/" ++ content_dir ++ "shaders/";
-    return [9][]const u8{
+    return [11][]const u8{
         thisDir() ++ "/../../libs/zwin32/bin/x64/dxc.exe",
         thisDir() ++ "/" ++ input_path,
         if (entry_point.len == 0) "" else "/E " ++ entry_point,
@@ -212,7 +238,9 @@ fn makeDxcCmd(
         if (define.len == 0) "" else "/D " ++ define,
         "/WX",
         "/Ges",
-        "/O3",
+        if (debug) "/Od" else "/O3",
+        if (debug) "/Zi" else "",
+        if (debug) "/Qembed_debug" else "",
     };
 }
 

@@ -34,8 +34,8 @@ const FrameConst = struct {
     view: Mat4,
     proj: Mat4,
     view_proj: Mat4,
-    inv_proj: Mat4,
     inv_view: Mat4,
+    inv_proj: Mat4,
     camera_position: Vec4,
     position_buffer_index: u32,
     normal_buffer_index: u32,
@@ -43,19 +43,46 @@ const FrameConst = struct {
     tangent_buffer_index: u32,
     index_buffer_index: u32,
     material_buffer_index: u32,
+    transform_buffer_index: u32,
 };
 
 const DispatchParams = struct {
-    num_thread_groups: [4]u32,
-    num_threads: [4]u32,
+    num_thread_groups: [3]u32,
+    _padding0: u32,
+    num_threads: [3]u32,
+    _padding1: u32,
+
+    pub const block_size: u32 = 16;
+
+    pub fn init(viewport_width: u32, viewport_height: u32) DispatchParams {
+        const f_block_size: f32 = @intToFloat(f32, block_size);
+        const f_width: f32 = @intToFloat(f32, viewport_width);
+        const f_height: f32 = @intToFloat(f32, viewport_height);
+
+        const num_thread_groups = [3]u32{
+            @floatToInt(u32, @ceil(f_width / f_block_size)),
+            @floatToInt(u32, @ceil(f_height / f_block_size)),
+            1,
+        };
+        const num_threads = [3]u32{
+            num_thread_groups[0] * block_size,
+            num_thread_groups[1] * block_size,
+            1
+        };
+
+        return DispatchParams {
+            .num_thread_groups = num_thread_groups,
+            ._padding0 = 0,
+            .num_threads = num_threads,
+            ._padding1 = 0,
+        };
+    }
 };
 
-// TODO: Store model matrices in a storage buffer
-// instead of sending them before every draw call.
-// Material index can be sent then as Root Constant
+// TODO: These indices can be sent then as Root Constant
 const DrawConst = struct {
-    object_to_world: Mat4,
     material_index: u32,
+    transform_index: u32,
 };
 
 const Mesh = struct {
@@ -64,13 +91,12 @@ const Mesh = struct {
     num_indices: u32,
     num_vertices: u32,
     material_index: u32,
+    transform_index: u32,
 };
 
-// pub const AlphaMode = enum(u8) {
-//     opaque = 0,
-//     mask = 1,
-//     blend = 2,
-// };
+const Transform = struct {
+    world_matrix: Mat4,
+};
 
 const Material = struct {
     base_color: Vec3,
@@ -92,6 +118,7 @@ const Material = struct {
 
 const Light = struct {
     position_ws: [4]f32,        // world space position for point lights, direction for directional lights
+    position_vs: [4]f32,        // view space position for point lights, direction for directional lights
     radiance: [4]f32,           // xyz: radiance. w: intensity
     radius: f32,                // only used for point lights
     light_type: u32,            // 0: directional, 1: point
@@ -146,13 +173,14 @@ const DeferredstateState = struct {
     // PSOs
     frustums_grid_pso: zd3d12.PipelineHandle,
     clear_buffers_pso: zd3d12.PipelineHandle,
+    update_lights_pso: zd3d12.PipelineHandle,
     light_culling_pso: zd3d12.PipelineHandle,
     z_pre_pass_opaque_pso: zd3d12.PipelineHandle,
     z_pre_pass_alpha_tested_pso: zd3d12.PipelineHandle,
     geometry_pass_opaque_pso: zd3d12.PipelineHandle,
     geometry_pass_alpha_tested_pso: zd3d12.PipelineHandle,
     compute_shading_pso: zd3d12.PipelineHandle,
-    debug_view_pso: zd3d12.PipelineHandle,
+    final_blit_pso: zd3d12.PipelineHandle,
 
     // Geometry Data
     position_buffer: PersistentResource,
@@ -161,9 +189,9 @@ const DeferredstateState = struct {
     tangent_buffer: PersistentResource,
     index_buffer: PersistentResource,
     material_buffer: PersistentResource,
+    transform_buffer: PersistentResource,
 
     // Lighting Data
-    // TODO: Create a struct to encapsulates buffer, SRV, UAV
     lights: std.ArrayList(Light),
     frustums_buffer: Buffer,
     light_buffer: Buffer,
@@ -176,6 +204,7 @@ const DeferredstateState = struct {
     opaque_mesh_indices: std.ArrayList(u32),
     materials: std.ArrayList(Material),
     textures: std.ArrayList(Texture),
+    transforms: std.ArrayList(Transform),
 
     need_to_compute_frustrums: bool,
 
@@ -192,6 +221,7 @@ const DeferredstateState = struct {
         cursor_prev_y: i32,
     },
 
+    view_modes: [6][]const u8,
     view_mode: i32,
 
     pub fn init(allocator: std.mem.Allocator) !DeferredstateState {
@@ -231,6 +261,16 @@ const DeferredstateState = struct {
                 arena_allocator,
                 &pso_desc,
                 content_dir ++ "shaders/clear_buffers.cs.cso",
+            );
+        };
+
+        const update_lights_pso = blk: {
+            var pso_desc = d3d12.COMPUTE_PIPELINE_STATE_DESC.initDefault();
+
+            break :blk gctx.createComputeShaderPipeline(
+                arena_allocator,
+                &pso_desc,
+                content_dir ++ "shaders/update_lights.cs.cso",
             );
         };
 
@@ -322,8 +362,8 @@ const DeferredstateState = struct {
             );
         };
 
-        // Debug View PSO
-        const debug_view_pso = blk: {
+        // Final Blit PSO
+        const final_blit_pso = blk: {
             // NOTE: This causes a warning because we're not binding a depth buffer.
             var pso_desc = d3d12.GRAPHICS_PIPELINE_STATE_DESC.initDefault();
             pso_desc.RTVFormats[0] = .R8G8B8A8_UNORM;
@@ -334,8 +374,8 @@ const DeferredstateState = struct {
             break :blk gctx.createGraphicsShaderPipeline(
                 arena_allocator,
                 &pso_desc,
-                content_dir ++ "shaders/debug_view.vs.cso",
-                content_dir ++ "shaders/debug_view.ps.cso",
+                content_dir ++ "shaders/final_blit.vs.cso",
+                content_dir ++ "shaders/final_blit.ps.cso",
             );
         };
 
@@ -377,7 +417,7 @@ const DeferredstateState = struct {
         const rt0 = createRenderTarget(&gctx, .R10G10B10A2_UNORM, &[4]f32{ 0.0, 0.0, 0.0, 1.0 }, true, false);
         const rt1 = createRenderTarget(&gctx, .R10G10B10A2_UNORM, &[4]f32{ 0.0, 1.0, 0.0, 1.0 }, true, false);
         const rt2 = createRenderTarget(&gctx, .R8G8B8A8_UNORM, &[4]f32{ 0.0, 0.5, 0.0, 1.0 }, true, false);
-        const rt_hdr = createRenderTarget(&gctx, .R16G16B16A16_FLOAT, &[4]f32{ 0.0, 0.0, 0.0, 1.0 }, false, true);
+        const rt_hdr = createRenderTarget(&gctx, .R16G16B16A16_FLOAT, &[4]f32{ 0.0, 0.0, 0.0, 1.0 }, true, true);
 
         var mipgen_rgba8 = zd3d12.MipmapGenerator.init(arena_allocator, &gctx, .R8G8B8A8_UNORM, content_dir);
 
@@ -405,10 +445,22 @@ const DeferredstateState = struct {
 
             // Add a directional light
             lights.append(.{
-                .position_ws = [4]f32{ 0.32139, 0.76604, -0.55667, 0.0 },
-                .radiance = [4]f32{ 14.0, 14.0, 10.0, 0.0 },
+                .position_ws = [4]f32{ 0.32139, 0.76604, -0.55667, 1.0 },
+                .position_vs = [4]f32{ 0.0, 0.0, 0.0, 1.0 },
+                .radiance = [4]f32{ 1.0, 1.0, 1.0, 0.0 },
                 .radius = 0.0,
                 .light_type = 0,
+                .enabled = true,
+                ._padding = 42.0,
+            }) catch unreachable;
+
+            // Add a point light
+            lights.append(.{
+                .position_ws = [4]f32{ 0.0, 1.0, 0.0, 1.0 },
+                .position_vs = [4]f32{ 0.0, 0.0, 0.0, 1.0 },
+                .radiance = [4]f32{ 0.0, 0.0, 1.0, 0.0 },
+                .radius = 2.0,
+                .light_type = 1,
                 .enabled = true,
                 ._padding = 42.0,
             }) catch unreachable;
@@ -417,7 +469,8 @@ const DeferredstateState = struct {
             // TODO: Randomly distribute them in a sphere?
             while (lights.items.len < num_lights) {
                 lights.append(.{
-                    .position_ws = [4]f32{0.0, 0.0, 0.0, 0.0},
+                    .position_ws = [4]f32{0.0, 0.0, 0.0, 1.0},
+                    .position_vs = [4]f32{0.0, 0.0, 0.0, 1.0},
                     .radiance = [4]f32{0.0, 0.0, 0.0, 0.0},
                     .radius = 0.0,
                     .light_type = 0,
@@ -430,7 +483,7 @@ const DeferredstateState = struct {
                 &gctx,
                 &d3d12.RESOURCE_DESC.initBuffer(num_lights * @sizeOf(Light)),
                 &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(0, num_lights, @sizeOf(Light)),
-                null,
+                &d3d12.UNORDERED_ACCESS_VIEW_DESC.initStructuredBuffer(0, num_lights, @sizeOf(Light), 0),
                 d3d12.RESOURCE_STATE_COMMON,
                 Light,
                 &lights,
@@ -446,17 +499,19 @@ const DeferredstateState = struct {
                 null,
             );
 
+            const num_thread_groups = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_width) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_height) / 16.0)), 0, 0 };
+            const average_light_per_tile: u32 = 200;
+            const max_light_list_lights: u32 = num_thread_groups[0] * num_thread_groups[1] * average_light_per_tile;
+
             const light_index_list_buffer = createBuffer(
                 &gctx,
-                &d3d12.RESOURCE_DESC.initBuffer(num_lights * @sizeOf(u32)),
-                &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(0, num_lights, @sizeOf(u32)),
-                &d3d12.UNORDERED_ACCESS_VIEW_DESC.initStructuredBuffer(0, num_lights, @sizeOf(u32), 0),
+                &d3d12.RESOURCE_DESC.initBuffer(max_light_list_lights * @sizeOf(u32)),
+                &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(0, max_light_list_lights, @sizeOf(u32)),
+                &d3d12.UNORDERED_ACCESS_VIEW_DESC.initStructuredBuffer(0, max_light_list_lights, @sizeOf(u32), 0),
                 d3d12.RESOURCE_STATE_UNORDERED_ACCESS,
                 u32,
                 null,
             );
-
-            const num_thread_groups = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_width) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_height) / 16.0)), 0, 0 };
 
             var srv_desc = std.mem.zeroes(d3d12.SHADER_RESOURCE_VIEW_DESC);
             srv_desc = .{
@@ -511,6 +566,7 @@ const DeferredstateState = struct {
             var meshes = std.ArrayList(Mesh).init(allocator);
             var materials = std.ArrayList(Material).init(allocator);
             var textures = std.ArrayList(Texture).init(allocator);
+            var transforms = std.ArrayList(Transform).init(allocator);
 
             const data_handle = try zmesh.gltf.parseAndLoadFile(content_dir ++ "Sponza/Sponza.gltf");
             defer zmesh.gltf.freeData(data_handle);
@@ -568,8 +624,16 @@ const DeferredstateState = struct {
                         .num_indices = @intCast(u32, indices.items.len - pre_indices_len),
                         .num_vertices = @intCast(u32, positions.items.len - pre_positions_len),
                         .material_index = assigned_material_index,
+                        .transform_index = @intCast(u32, transforms.items.len),
                     }) catch unreachable;
+
+                    transforms.append(.{ .world_matrix = Mat4.initIdentity() }) catch unreachable;
                 }
+            }
+
+            // NOTE(mziulek): Sponza requires scaling.
+            for (positions.items) |position, i| {
+                positions.items[i] = [3]f32{ position[0] * 0.008, position[1] * 0.008, position[2] * 0.008 };
             }
 
             // Create Position Buffer, a persisten view and upload all positions to the GPU
@@ -794,9 +858,24 @@ const DeferredstateState = struct {
                 &materials,
             );
 
+            // Create Transform Buffer, a persistent view and upload all indices to the GPU
+            const transform_buffer = createPersistentResource(
+                &gctx,
+                &d3d12.RESOURCE_DESC.initBuffer(transforms.items.len * @sizeOf(Transform)),
+                &d3d12.SHADER_RESOURCE_VIEW_DESC.initStructuredBuffer(
+                    0,
+                    @intCast(u32, transforms.items.len),
+                    @sizeOf(Transform),
+                ),
+                d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                Transform,
+                &transforms,
+            );
+
             break :blk .{
                 .meshes = meshes,
                 .materials = materials,
+                .transforms = transforms,
                 .textures = textures,
                 .alpha_tested_mesh_indices = alpha_tested_mesh_indices,
                 .opaque_mesh_indices = opaque_mesh_indices,
@@ -806,6 +885,7 @@ const DeferredstateState = struct {
                 .tangent_buffer = tangent_buffer,
                 .index_buffer = index_buffer,
                 .material_buffer = material_buffer,
+                .transform_buffer = transform_buffer,
             };
         };
 
@@ -831,16 +911,18 @@ const DeferredstateState = struct {
 
             .frustums_grid_pso = frustums_grid_pso,
             .clear_buffers_pso = clear_buffers_pso,
+            .update_lights_pso = update_lights_pso,
             .light_culling_pso = light_culling_pso,
             .z_pre_pass_opaque_pso = z_pre_pass_psos.opaque_pso,
             .z_pre_pass_alpha_tested_pso = z_pre_pass_psos.alpha_tested_pso,
             .geometry_pass_opaque_pso = geometry_pass_psos.opaque_pso,
             .geometry_pass_alpha_tested_pso = geometry_pass_psos.alpha_tested_pso,
             .compute_shading_pso = compute_shading_pso,
-            .debug_view_pso = debug_view_pso,
+            .final_blit_pso = final_blit_pso,
 
             .meshes = geometry.meshes,
             .materials = geometry.materials,
+            .transforms = geometry.transforms,
             .textures = geometry.textures,
             .alpha_tested_mesh_indices = geometry.alpha_tested_mesh_indices,
             .opaque_mesh_indices = geometry.opaque_mesh_indices,
@@ -850,6 +932,7 @@ const DeferredstateState = struct {
             .tangent_buffer = geometry.tangent_buffer,
             .index_buffer = geometry.index_buffer,
             .material_buffer = geometry.material_buffer,
+            .transform_buffer = geometry.transform_buffer,
 
             .need_to_compute_frustrums = true,
             .lights = lighting_resources.lights,
@@ -859,15 +942,23 @@ const DeferredstateState = struct {
             .light_index_list_buffer = lighting_resources.light_index_list_buffer,
             .light_grid_buffer = lighting_resources.light_grid_buffer,
 
-            .view_mode = 2,
+            .view_modes = .{
+                "Lit",
+                "Depth",
+                "Albedo",
+                "World Space Normals",
+                "Metalness",
+                "Roughness",
+            },
+            .view_mode = 0,
 
             .camera = .{
                 .position = Vec3.init(0.0, 1.0, 0.0),
-                .forward = Vec3.initZero(),
+                .forward = Vec3.init(0.0, 0.0, -1.0),
                 .pitch = 0.0,
-                .yaw = math.pi + 0.25 * math.pi,
+                .yaw = 0.0,
                 .znear = 0.1,
-                .zfar = 50.0,
+                .zfar = 5000.0,
             },
             .mouse = .{
                 .cursor_prev_x = 0,
@@ -886,6 +977,7 @@ const DeferredstateState = struct {
 
         state.meshes.deinit();
         state.materials.deinit();
+        state.transforms.deinit();
         state.textures.deinit();
         state.alpha_tested_mesh_indices.deinit();
         state.opaque_mesh_indices.deinit();
@@ -898,6 +990,12 @@ const DeferredstateState = struct {
         common.newImGuiFrame(state.frame_stats.delta_time);
 
         _ = c.igBegin("Demo Settings", null, 0);
+
+        // CIMGUI_API bool igCombo_Str_arr(const char* label,int* current_item,const char* const items[],int items_count,int popup_max_height_in_items);
+        // if (c.igCombo_Str_arr("View Mode", &state.view_mode, @ptrCast([*c]const [*c]const u8, &state.view_modes), @intCast(i32, state.view_modes.len), -1)) {
+        //     c.igEndCombo();
+        // }
+
         _ = c.igRadioButton_IntPtr("Lit", &state.view_mode, 0);
         _ = c.igRadioButton_IntPtr("Depth", &state.view_mode, 1);
         _ = c.igRadioButton_IntPtr("Albedo", &state.view_mode, 2);
@@ -966,7 +1064,7 @@ const DeferredstateState = struct {
             vm.Vec3.init(0.0, 1.0, 0.0),
         );
         const proj_matrix = vm.Mat4.initPerspectiveFovLh(
-            math.pi / 3.0,
+            1.0472, // 60 deg
             @intToFloat(f32, gctx.viewport_width) / @intToFloat(f32, gctx.viewport_height),
             state.camera.znear,
             state.camera.zfar,
@@ -994,17 +1092,13 @@ const DeferredstateState = struct {
             .tangent_buffer_index = state.tangent_buffer.persistent_descriptor.index,
             .index_buffer_index = state.index_buffer.persistent_descriptor.index,
             .material_buffer_index = state.material_buffer.persistent_descriptor.index,
+            .transform_buffer_index = state.transform_buffer.persistent_descriptor.index,
         };
 
         // Compute Frustum Grid
-        const num_thread_groups = [4]u32{ @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_width) / 16.0)), @floatToInt(u32, @ceil(@intToFloat(f32, gctx.viewport_height) / 16.0)), 0, 0 };
-        const num_threads = [4]u32{ num_thread_groups[0] * 16, num_thread_groups[0] * 16, 0, 0 };
-
-        const dispatch_params = gctx.allocateUploadMemory(DispatchParams, 1);
-        dispatch_params.cpu_slice[0] = .{
-            .num_thread_groups = num_thread_groups,
-            .num_threads = num_threads,
-        };
+        const dispatch_params = DispatchParams.init(gctx.viewport_width, gctx.viewport_height);
+        const dispatch_params_mem = gctx.allocateUploadMemory(DispatchParams, 1);
+        dispatch_params_mem.cpu_slice[0] = dispatch_params;
 
         if (state.need_to_compute_frustrums) {
             zpix.beginEvent(gctx.cmdlist, "Compute Frustum Grid");
@@ -1020,12 +1114,12 @@ const DeferredstateState = struct {
                 0,
             );
             gctx.cmdlist.SetComputeRootConstantBufferView(1, frame_const_mem.gpu_base);
-            gctx.cmdlist.SetComputeRootConstantBufferView(2, dispatch_params.gpu_base);
+            gctx.cmdlist.SetComputeRootConstantBufferView(2, dispatch_params_mem.gpu_base);
             gctx.cmdlist.SetComputeRootDescriptorTable(
                 3,
                 gctx.copyDescriptorsToGpuHeap(1, state.frustums_buffer.uav),
             );
-            gctx.cmdlist.Dispatch(num_thread_groups[0], num_thread_groups[1], 1);
+            gctx.cmdlist.Dispatch(dispatch_params.num_thread_groups[0], dispatch_params.num_thread_groups[1], dispatch_params.num_thread_groups[2]);
         }
 
         // Z-PrePass
@@ -1055,8 +1149,8 @@ const DeferredstateState = struct {
                     gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
                     const draw_const_mem = gctx.allocateUploadMemory(DrawConst, 1);
                     draw_const_mem.cpu_slice[0] = .{
-                        .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
                         .material_index = mesh.material_index,
+                        .transform_index = mesh.transform_index,
                     };
                     gctx.cmdlist.SetGraphicsRootConstantBufferView(2, draw_const_mem.gpu_base);
                     gctx.cmdlist.DrawInstanced(mesh.num_indices, 1, 0, 0);
@@ -1075,8 +1169,8 @@ const DeferredstateState = struct {
                     gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
                     const draw_const_mem = gctx.allocateUploadMemory(DrawConst, 1);
                     draw_const_mem.cpu_slice[0] = .{
-                        .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
                         .material_index = mesh.material_index,
+                        .transform_index = mesh.transform_index,
                     };
                     gctx.cmdlist.SetGraphicsRootConstantBufferView(2, draw_const_mem.gpu_base);
                     gctx.cmdlist.DrawInstanced(mesh.num_indices, 1, 0, 0);
@@ -1108,7 +1202,7 @@ const DeferredstateState = struct {
                 gctx.cmdlist.SetComputeRootConstantBufferView(1, frame_const_mem.gpu_base);
 
                 // Dispatch Params
-                gctx.cmdlist.SetComputeRootConstantBufferView(2, dispatch_params.gpu_base);
+                gctx.cmdlist.SetComputeRootConstantBufferView(2, dispatch_params_mem.gpu_base);
 
                 gctx.cmdlist.SetComputeRootDescriptorTable(3, blk: {
                     const table = gctx.copyDescriptorsToGpuHeap(1, state.light_index_counter_buffer.uav);
@@ -1116,6 +1210,38 @@ const DeferredstateState = struct {
                     _ = gctx.copyDescriptorsToGpuHeap(1, state.light_grid_buffer.uav);
                     break :blk table;
                 });
+
+                gctx.cmdlist.Dispatch(1, 1, 1);
+            }
+
+            // Update lights
+            {
+                zpix.beginEvent(gctx.cmdlist, "Update Lights");
+                defer zpix.endEvent(gctx.cmdlist);
+
+                gctx.setCurrentPipeline(state.update_lights_pso);
+
+                // Root Constants
+                gctx.cmdlist.SetComputeRoot32BitConstants(
+                    0,
+                    2, 
+                    &.{ gctx.viewport_width, gctx.viewport_height },
+                    0,
+                );
+
+                // Frame Constants
+                gctx.cmdlist.SetComputeRootConstantBufferView(1, frame_const_mem.gpu_base);
+
+                // Dispatch Params
+                gctx.cmdlist.SetComputeRootConstantBufferView(2, dispatch_params_mem.gpu_base);
+
+                gctx.cmdlist.SetComputeRootDescriptorTable(3, blk: {
+                    const table = gctx.copyDescriptorsToGpuHeap(1, state.light_buffer.uav);
+                    break :blk table;
+                });
+
+                gctx.addTransitionBarrier(state.light_buffer.resource, d3d12.RESOURCE_STATE_UNORDERED_ACCESS);
+                gctx.flushResourceBarriers();
 
                 gctx.cmdlist.Dispatch(1, 1, 1);
             }
@@ -1139,7 +1265,7 @@ const DeferredstateState = struct {
             gctx.cmdlist.SetComputeRootConstantBufferView(1, frame_const_mem.gpu_base);
 
             // Dispatch Params
-            gctx.cmdlist.SetComputeRootConstantBufferView(2, dispatch_params.gpu_base);
+            gctx.cmdlist.SetComputeRootConstantBufferView(2, dispatch_params_mem.gpu_base);
 
             gctx.cmdlist.SetComputeRootDescriptorTable(3, blk: {
                 const table = gctx.copyDescriptorsToGpuHeap(1, state.depth_texture_srv);
@@ -1151,7 +1277,10 @@ const DeferredstateState = struct {
                 break :blk table;
             });
 
-            gctx.cmdlist.Dispatch(num_thread_groups[0], num_thread_groups[1], 1);
+            gctx.addTransitionBarrier(state.light_buffer.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.flushResourceBarriers();
+
+            gctx.cmdlist.Dispatch(dispatch_params.num_thread_groups[0], dispatch_params.num_thread_groups[1], dispatch_params.num_thread_groups[2]);
         }
 
         // Geometry Pass
@@ -1208,8 +1337,8 @@ const DeferredstateState = struct {
                     gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
                     const draw_const_mem = gctx.allocateUploadMemory(DrawConst, 1);
                     draw_const_mem.cpu_slice[0] = .{
-                        .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
                         .material_index = mesh.material_index,
+                        .transform_index = mesh.transform_index,
                     };
                     gctx.cmdlist.SetGraphicsRootConstantBufferView(2, draw_const_mem.gpu_base);
                     gctx.cmdlist.DrawInstanced(mesh.num_indices, 1, 0, 0);
@@ -1229,8 +1358,8 @@ const DeferredstateState = struct {
                     gctx.cmdlist.SetGraphicsRoot32BitConstants(0, 2, &.{ mesh.vertex_offset, mesh.index_offset }, 0);
                     const draw_const_mem = gctx.allocateUploadMemory(DrawConst, 1);
                     draw_const_mem.cpu_slice[0] = .{
-                        .object_to_world = Mat4.initScaling(Vec3.init(0.008, 0.008, 0.008)).transpose(),
                         .material_index = mesh.material_index,
+                        .transform_index = mesh.transform_index,
                     };
                     gctx.cmdlist.SetGraphicsRootConstantBufferView(2, draw_const_mem.gpu_base);
                     gctx.cmdlist.DrawInstanced(mesh.num_indices, 1, 0, 0);
@@ -1274,13 +1403,13 @@ const DeferredstateState = struct {
                 break :blk table;
             });
 
-            gctx.cmdlist.Dispatch(num_thread_groups[0], num_thread_groups[1], 1);
+            gctx.cmdlist.Dispatch(dispatch_params.num_thread_groups[0], dispatch_params.num_thread_groups[1], dispatch_params.num_thread_groups[2]);
         }
 
         const back_buffer = gctx.getBackBuffer();
-        // Debug View
+        // Final Blit
         {
-            zpix.beginEvent(gctx.cmdlist, "Debug View");
+            zpix.beginEvent(gctx.cmdlist, "Final Blit");
             defer zpix.endEvent(gctx.cmdlist);
 
             // Transition the depth buffer from Depth attachment to "Texture" attachment
@@ -1289,6 +1418,7 @@ const DeferredstateState = struct {
             gctx.addTransitionBarrier(state.rt0.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             gctx.addTransitionBarrier(state.rt1.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             gctx.addTransitionBarrier(state.rt2.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gctx.addTransitionBarrier(state.rt_hdr.resource, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             // Transition the back buffer to render target
             gctx.addTransitionBarrier(back_buffer.resource_handle, d3d12.RESOURCE_STATE_RENDER_TARGET);
             gctx.flushResourceBarriers();
@@ -1306,7 +1436,7 @@ const DeferredstateState = struct {
                 null,
             );
 
-            gctx.setCurrentPipeline(state.debug_view_pso);
+            gctx.setCurrentPipeline(state.final_blit_pso);
             gctx.cmdlist.SetGraphicsRoot32BitConstants(
                 0,
                 3,
@@ -1318,6 +1448,7 @@ const DeferredstateState = struct {
                 _ = gctx.copyDescriptorsToGpuHeap(1, state.rt0.srv);
                 _ = gctx.copyDescriptorsToGpuHeap(1, state.rt1.srv);
                 _ = gctx.copyDescriptorsToGpuHeap(1, state.rt2.srv);
+                _ = gctx.copyDescriptorsToGpuHeap(1, state.rt_hdr.srv);
                 break :blk table;
             });
             gctx.cmdlist.DrawInstanced(3, 1, 0, 0);
