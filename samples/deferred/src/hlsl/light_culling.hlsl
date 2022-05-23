@@ -222,13 +222,14 @@ void csLightCulling(ComputeShaderInput input)
                     break;
                 case 1: // Point
                 {
-                    // append_light(i);
-                    Sphere sphere = { light.position_vs.xyz, light.radius };
-                    if (sphereInsideFrustum(sphere, group_frustum, near_clip_vs, max_depth_vs)) {
-                        if (!sphereInsidePlane(sphere, min_plane)) {
-                            append_light(i);
-                        }
-                    }
+                    append_light(i);
+                    // TODO: This passes only when the camera is inside the sphere
+                    // Sphere sphere = { light.position_vs.xyz, light.radius };
+                    // if (sphereInsideFrustum(sphere, group_frustum, near_clip_vs, max_depth_vs)) {
+                    //     if (!sphereInsidePlane(sphere, min_plane)) {
+                    //         append_light(i);
+                    //     }
+                    // }
                 }
                 break;
             }

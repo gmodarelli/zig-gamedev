@@ -23,7 +23,7 @@ pub fn build(b: *std.build.Builder, options: Options) *std.build.LibExeObjStep {
     exe.setTarget(options.target);
     exe.addOptions("build_options", exe_options);
 
-    const dxc_step = buildShaders(b, options.enable_dx_debug);
+    const dxc_step = buildShaders(b, false);
     const install_content_step = b.addInstallDirectory(.{
         .source_dir = thisDir() ++ "/" ++ content_dir,
         .install_dir = .{ .custom = "" },

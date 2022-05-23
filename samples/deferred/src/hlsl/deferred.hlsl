@@ -208,11 +208,13 @@ void csDeferredShading(uint3 dispatch_id : SV_DispatchThreadID) {
     // Extract metalness and roughness from Gbuffer
     float2 data = gbuffer2.Load(uint3(dispatch_id.xy, 0)).rg;
 
-    // PBRInput pbr_input = (PBRInput)0;
-    // pbr_input.v = normalize(cvb_frame_const.camera_position.xyz - position_ws);
-    // pbr_input.n = n;
-    // pbr_input.metallic = data.r;
-    // pbr_input.roughness = data.g;
+    float4 eye_pos = float4(0, 0, 0, 1);
+    PBRInput pbr_input = (PBRInput)0;
+    pbr_input.v = normalize(eye_pos - position_vs);
+    pbr_input.n = normal_vs;
+    pbr_input.p = position_vs;
+    pbr_input.metallic = data.r;
+    pbr_input.roughness = data.g;
 
     // Get the index of the current pixel in the light grid
     uint2 tile_index = uint2(floor(dispatch_id.xy / BLOCK_SIZE));
@@ -220,21 +222,15 @@ void csDeferredShading(uint3 dispatch_id : SV_DispatchThreadID) {
     uint start_offset = light_grid[tile_index].x;
     uint light_count = light_grid[tile_index].y;
 
-    float4 eye_pos = float4(0, 0, 0, 1);
-    LightingResult lighting;
-    lighting.diffuse = float3(0, 0, 0);
-    lighting.specular = float3(0, 0, 0);
+    float3 lighting = 0.0;
 
     for (uint i = 0; i < light_count; i++) {
         uint light_index = light_index_list[start_offset + i];
         Light light = lights[light_index];
-        LightingResult contribution = calculateLighting(light, eye_pos, position_vs, normal_vs);
-        // lighting += calculateLighting(pbr_input, base_color, position_ws, light);
-        lighting.diffuse += contribution.diffuse;
-        lighting.specular += contribution.specular;
+        lighting += calculateLighting(pbr_input, base_color, light);
     }
 
-    output[dispatch_id.xy] = float4(base_color.rgb * lighting.diffuse.rgb, 1.0);
+    output[dispatch_id.xy] = float4(lighting.rgb, 1.0);
 }
 
 #elif defined(PSO__POST_PROCESSING)

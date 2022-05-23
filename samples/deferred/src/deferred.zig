@@ -221,7 +221,6 @@ const DeferredstateState = struct {
         cursor_prev_y: i32,
     },
 
-    view_modes: [6][]const u8,
     view_mode: i32,
 
     pub fn init(allocator: std.mem.Allocator) !DeferredstateState {
@@ -444,10 +443,11 @@ const DeferredstateState = struct {
             var lights = std.ArrayList(Light).init(allocator);
 
             // Add a directional light
+            // NOTE: Treating position_ws as a direction, hence 0.0 for its w component
             lights.append(.{
-                .position_ws = [4]f32{ 0.32139, 0.76604, -0.55667, 1.0 },
-                .position_vs = [4]f32{ 0.0, 0.0, 0.0, 1.0 },
-                .radiance = [4]f32{ 1.0, 1.0, 1.0, 0.0 },
+                .position_ws = [4]f32{ 0.32139, 0.76604, -0.55667, 0.0 },
+                .position_vs = [4]f32{ 0.0, 0.0, 0.0, 0.0 },
+                .radiance = [4]f32{ 10.0, 10.0, 10.0, 0.0 },
                 .radius = 0.0,
                 .light_type = 0,
                 .enabled = true,
@@ -458,7 +458,7 @@ const DeferredstateState = struct {
             lights.append(.{
                 .position_ws = [4]f32{ 0.0, 1.0, 0.0, 1.0 },
                 .position_vs = [4]f32{ 0.0, 0.0, 0.0, 1.0 },
-                .radiance = [4]f32{ 0.0, 0.0, 1.0, 0.0 },
+                .radiance = [4]f32{ 0.0, 0.0, 10.0, 0.0 },
                 .radius = 2.0,
                 .light_type = 1,
                 .enabled = true,
@@ -942,14 +942,6 @@ const DeferredstateState = struct {
             .light_index_list_buffer = lighting_resources.light_index_list_buffer,
             .light_grid_buffer = lighting_resources.light_grid_buffer,
 
-            .view_modes = .{
-                "Lit",
-                "Depth",
-                "Albedo",
-                "World Space Normals",
-                "Metalness",
-                "Roughness",
-            },
             .view_mode = 0,
 
             .camera = .{
@@ -990,11 +982,6 @@ const DeferredstateState = struct {
         common.newImGuiFrame(state.frame_stats.delta_time);
 
         _ = c.igBegin("Demo Settings", null, 0);
-
-        // CIMGUI_API bool igCombo_Str_arr(const char* label,int* current_item,const char* const items[],int items_count,int popup_max_height_in_items);
-        // if (c.igCombo_Str_arr("View Mode", &state.view_mode, @ptrCast([*c]const [*c]const u8, &state.view_modes), @intCast(i32, state.view_modes.len), -1)) {
-        //     c.igEndCombo();
-        // }
 
         _ = c.igRadioButton_IntPtr("Lit", &state.view_mode, 0);
         _ = c.igRadioButton_IntPtr("Depth", &state.view_mode, 1);
