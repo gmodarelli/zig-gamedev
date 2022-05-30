@@ -1,20 +1,11 @@
 const std = @import("std");
-const zwin32 = @import("../zwin32/build.zig");
-const ztracy = @import("../ztracy/build.zig");
-const zd3d12 = @import("../zd3d12/build.zig");
 
-pub fn getPkg(b: *std.build.Builder, options_pkg: std.build.Pkg) std.build.Pkg {
-    const pkg = std.build.Pkg{
+pub fn getPkg(dependencies: []const std.build.Pkg) std.build.Pkg {
+    return .{
         .name = "common",
-        .path = .{ .path = thisDir() ++ "/src/common.zig" },
-        .dependencies = &[_]std.build.Pkg{
-            zwin32.pkg,
-            ztracy.getPkg(b, options_pkg),
-            zd3d12.getPkg(b, options_pkg),
-            options_pkg,
-        },
+        .source = .{ .path = thisDir() ++ "/src/common.zig" },
+        .dependencies = dependencies,
     };
-    return b.dupePkg(pkg);
 }
 
 pub fn build(b: *std.build.Builder) void {
@@ -60,5 +51,7 @@ fn buildLibrary(exe: *std.build.LibExeObjStep) *std.build.LibExeObjStep {
 }
 
 fn thisDir() []const u8 {
-    return std.fs.path.dirname(@src().file) orelse ".";
+    comptime {
+        return std.fs.path.dirname(@src().file) orelse ".";
+    }
 }

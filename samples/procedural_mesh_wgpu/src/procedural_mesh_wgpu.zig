@@ -12,6 +12,8 @@ const wgsl = @import("procedural_mesh_wgsl.zig");
 const content_dir = @import("build_options").content_dir;
 const window_title = "zig-gamedev: procedural mesh (wgpu)";
 
+const IndexType = zmesh.Shape.IndexType;
+
 const Vertex = struct {
     position: [3]f32,
     normal: [3]f32,
@@ -69,7 +71,7 @@ const DemoState = struct {
 fn appendMesh(
     mesh: zmesh.Shape,
     meshes: *std.ArrayList(Mesh),
-    meshes_indices: *std.ArrayList(u16),
+    meshes_indices: *std.ArrayList(IndexType),
     meshes_positions: *std.ArrayList([3]f32),
     meshes_normals: *std.ArrayList([3]f32),
 ) void {
@@ -89,7 +91,7 @@ fn initScene(
     allocator: std.mem.Allocator,
     drawables: *std.ArrayList(Drawable),
     meshes: *std.ArrayList(Mesh),
-    meshes_indices: *std.ArrayList(u16),
+    meshes_indices: *std.ArrayList(IndexType),
     meshes_positions: *std.ArrayList([3]f32),
     meshes_normals: *std.ArrayList([3]f32),
 ) void {
@@ -306,13 +308,13 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
     const bind_group_layout = gctx.createBindGroupLayout(&.{
         zgpu.bglBuffer(0, .{ .vertex = true, .fragment = true }, .uniform, true, 0),
     });
-    defer gctx.destroyResource(bind_group_layout);
+    defer gctx.releaseResource(bind_group_layout);
 
     const pipeline_layout = gctx.createPipelineLayout(&.{
         bind_group_layout,
         bind_group_layout,
     });
-    defer gctx.destroyResource(pipeline_layout);
+    defer gctx.releaseResource(pipeline_layout);
 
     const pipeline = pipeline: {
         const vs_module = gctx.device.createShaderModule(&.{ .label = "vs", .code = .{ .wgsl = wgsl.vs } });
@@ -363,12 +365,17 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
     };
 
     const bind_group = gctx.createBindGroup(bind_group_layout, &[_]zgpu.BindGroupEntryInfo{
-        .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = 256 },
+        .{
+            .binding = 0,
+            .buffer_handle = gctx.uniforms.buffer,
+            .offset = 0,
+            .size = math.max(@sizeOf(FrameUniforms), @sizeOf(DrawUniforms)),
+        },
     });
 
     var drawables = std.ArrayList(Drawable).init(allocator);
     var meshes = std.ArrayList(Mesh).init(allocator);
-    var meshes_indices = std.ArrayList(u16).init(arena);
+    var meshes_indices = std.ArrayList(IndexType).init(arena);
     var meshes_positions = std.ArrayList([3]f32).init(arena);
     var meshes_normals = std.ArrayList([3]f32).init(arena);
     initScene(allocator, &drawables, &meshes, &meshes_indices, &meshes_positions, &meshes_normals);
@@ -396,9 +403,9 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
     // Create an index buffer.
     const index_buffer = gctx.createBuffer(.{
         .usage = .{ .copy_dst = true, .index = true },
-        .size = total_num_indices * @sizeOf(u16),
+        .size = total_num_indices * @sizeOf(IndexType),
     });
-    gctx.queue.writeBuffer(gctx.lookupResource(index_buffer).?, 0, u16, meshes_indices.items);
+    gctx.queue.writeBuffer(gctx.lookupResource(index_buffer).?, 0, IndexType, meshes_indices.items);
 
     // Create a depth texture and its 'view'.
     const depth = createDepthTexture(gctx);
@@ -427,13 +434,13 @@ fn update(demo: *DemoState) void {
     zgpu.gui.newFrame(demo.gctx.swapchain_descriptor.width, demo.gctx.swapchain_descriptor.height);
 
     if (c.igBegin("Demo Settings", null, c.ImGuiWindowFlags_NoMove | c.ImGuiWindowFlags_NoResize)) {
-        c.igBulletText("Right Mouse Button + drag :  rotate camera");
-        c.igBulletText("W, A, S, D :  move camera");
         c.igBulletText(
             "Average :  %.3f ms/frame (%.1f fps)",
             demo.gctx.stats.average_cpu_time,
             demo.gctx.stats.fps,
         );
+        c.igBulletText("Right Mouse Button + drag :  rotate camera");
+        c.igBulletText("W, A, S, D :  move camera");
         c.igBulletText(
             "CPU is ahead of GPU by :  %d frame(s)",
             demo.gctx.stats.cpu_frame_number - demo.gctx.stats.gpu_frame_number,
@@ -467,25 +474,25 @@ fn update(demo: *DemoState) void {
         const transform = zm.mul(zm.rotationX(demo.camera.pitch), zm.rotationY(demo.camera.yaw));
         var forward = zm.normalize3(zm.mul(zm.f32x4(0.0, 0.0, 1.0, 0.0), transform));
 
-        zm.store(demo.camera.forward[0..], forward, 3);
+        zm.store3(&demo.camera.forward, forward);
 
         const right = speed * delta_time * zm.normalize3(zm.cross3(zm.f32x4(0.0, 1.0, 0.0, 0.0), forward));
         forward = speed * delta_time * forward;
 
-        var cpos = zm.load(demo.camera.position[0..], zm.Vec, 3);
+        var cam_pos = zm.load3(demo.camera.position);
 
         if (window.getKey(.w) == .press) {
-            cpos += forward;
+            cam_pos += forward;
         } else if (window.getKey(.s) == .press) {
-            cpos -= forward;
+            cam_pos -= forward;
         }
         if (window.getKey(.d) == .press) {
-            cpos += right;
+            cam_pos += right;
         } else if (window.getKey(.a) == .press) {
-            cpos -= right;
+            cam_pos -= right;
         }
 
-        zm.store(demo.camera.position[0..], cpos, 3);
+        zm.store3(&demo.camera.position, cam_pos);
     }
 }
 
@@ -495,8 +502,8 @@ fn draw(demo: *DemoState) void {
     const fb_height = gctx.swapchain_descriptor.height;
 
     const cam_world_to_view = zm.lookToLh(
-        zm.load(demo.camera.position[0..], zm.Vec, 3),
-        zm.load(demo.camera.forward[0..], zm.Vec, 3),
+        zm.load3(demo.camera.position),
+        zm.load3(demo.camera.forward),
         zm.f32x4(0.0, 1.0, 0.0, 0.0),
     );
     const cam_view_to_clip = zm.perspectiveFovLh(
@@ -544,7 +551,12 @@ fn draw(demo: *DemoState) void {
             }
 
             pass.setVertexBuffer(0, vb_info.gpuobj.?, 0, vb_info.size);
-            pass.setIndexBuffer(ib_info.gpuobj.?, .uint16, 0, ib_info.size);
+            pass.setIndexBuffer(
+                ib_info.gpuobj.?,
+                if (IndexType == u16) .uint16 else .uint32,
+                0,
+                ib_info.size,
+            );
 
             pass.setPipeline(pipeline);
 
@@ -559,7 +571,7 @@ fn draw(demo: *DemoState) void {
 
             for (demo.drawables.items) |drawable| {
                 // Update "object to world" xform.
-                const object_to_world = zm.translationV(zm.load(drawable.position[0..], zm.Vec, 3));
+                const object_to_world = zm.translationV(zm.load3(drawable.position));
 
                 const mem = gctx.uniformsAllocate(DrawUniforms, 1);
                 mem.slice[0].object_to_world = zm.transpose(object_to_world);
@@ -605,7 +617,7 @@ fn draw(demo: *DemoState) void {
 
     if (gctx.present() == .swap_chain_resized) {
         // Release old depth texture.
-        gctx.destroyResource(demo.depth_texture_view);
+        gctx.releaseResource(demo.depth_texture_view);
         gctx.destroyResource(demo.depth_texture);
 
         // Create a new depth texture to match the new window size.
@@ -636,13 +648,13 @@ fn createDepthTexture(gctx: *zgpu.GraphicsContext) struct {
 }
 
 pub fn main() !void {
-    zgpu.checkContent(content_dir) catch {
-        // In case of error zgpu.checkContent() will print error message.
-        return;
-    };
-
     try glfw.init(.{});
     defer glfw.terminate();
+
+    zgpu.checkSystem(content_dir) catch {
+        // In case of error zgpu.checkSystem() will print error message.
+        return;
+    };
 
     const window = try glfw.Window.create(1280, 960, window_title, null, null, .{
         .client_api = .no_api,

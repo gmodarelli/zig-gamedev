@@ -1,4 +1,135 @@
+//  zgpu v0.1
+//
+//  This library uses GLFW and WebGPU bindings + great build script from
+//  [mach/gpu](https://github.com/hexops/mach/tree/main/gpu) project.
+//
+//  `zgpu` is a cross-platform (Windows/Linux/MacOS) graphics layer built on top of WebGPU API (Dawn).
+//  Below you can find an overview of its main features.
+//
+//  1. Init
+//
+//      const gctx = try zgpu.GraphicsContext.init(allocator, window);
+//
+//      // When you are done:
+//      gctx.deinit(allocator);
+//
+//  2. Uniforms
+//
+//      * Implemented as a uniform buffer pool
+//      * Easy to use
+//      * Efficient - only one copy operation per frame
+//
+//      struct DrawUniforms = extern struct {
+//          object_to_world: zm.Mat,
+//      };
+//      const mem = gctx.uniformsAllocate(DrawUniforms, 1);
+//      mem.slice[0] = .{ .object_to_world = zm.transpose(zm.translation(...)) };
+//
+//      pass.setBindGroup(0, bind_group, &.{mem.offset});
+//      pass.drawIndexed(...);
+//
+//      // When you are done encoding all commands for a frame:
+//      gctx.submit(...); // Injects *one* copy operation to transfer *all* allocated uniforms
+//
+//  3. Resource pools
+//
+//      * Every GPU resource is identified by a 32-bit integer handle
+//      * All resources are stored in one system
+//      * We keep basic info about each resource (size of the buffer, format of the texture, etc.)
+//      * You can always check if resource is valid (very useful for async operations)
+//      * System keeps basic info about resource dependencies, for example, `TextureViewHandle` knows about its
+//        parent texture and becomes invalid when parent texture becomes invalid; `BindGroupHandle` knows
+//        about all resources it binds so it becomes invalid if any of those resources become invalid
+//
+//      const buffer_handle = gctx.createBuffer(...);
+//
+//      if (gctx.isResourceValid(buffer_handle)) {
+//          const buffer = gctx.lookupResource(buffer_handle).?; // Returns gpu.Buffer
+//
+//          const buffer_info = gctx.lookupResourceInfo(buffer_handle).?; // Returns zgpu.BufferInfo
+//          std.debug.print("Buffer size is: {d}", .{buffer_info.size});
+//      }
+//      // If you want to destroy a resource before shutting down graphics context:
+//      gctx.destroyResource(buffer_handle);
+//
+//  4. Async shader compilation
+//
+//      * Thanks to resource pools and resources identified by handles we can easily async compile
+//        all our shaders
+//
+//      const DemoState = struct {
+//          pipeline_handle: zgpu.PipelineLayoutHandle = .{},
+//          ...
+//      };
+//      const demo = try allocator.create(DemoState);
+//      // Below call schedules pipeline compilation and returns immediately. When compilation is complete
+//      // valid pipeline handle will be stored in `demo.pipeline_handle`.
+//      gctx.createRenderPipelineAsync(allocator, pipeline_layout, pipeline_descriptor, &demo.pipeline_handle);
+//
+//      // Pass using our pipeline will be skipped until compilation is ready
+//      pass: {
+//          const pipeline = gctx.lookupResource(demo.pipeline_handle) orelse break :pass;
+//          ...
+//
+//          pass.setPipeline(pipeline);
+//          pass.drawIndexed(...);
+//      }
+//
+//  5. Mipmap generation on the GPU
+//
+//      * WebGPU API does not provide mipmap generator
+//      * zgpu provides decent mipmap generator implemented in a compute shader
+//      * It supports 2D textures, array textures and cubemap textures of any format
+//        (rgba8_unorm, rg16_float, rgba32_float, etc.)
+//      * Currently it requires that: width == height and isPowerOfTwo(width)
+//      * It takes ~260 us to generate all mips for 1024x1024 rgba8_unorm texture on GTX 1660
+//
+//      // Usage:
+//      gctx.generateMipmaps(arena, command_encoder, texture_handle);
+//
+//  6. Image loading with 'stb_image' library (optional)
+//
+//      // Defined in zgpu.stbi namespace
+//      pub const Image = struct {
+//          data: []u8,
+//          width: u32,
+//          height: u32,
+//          channels_in_memory: u32,
+//          channels_in_file: u32,
+//          ...
+//      };
+//
+//      // Usage:
+//      var image = try zgpu.stbi.Image.init("path_to_image_file", num_desired_channels);
+//      defer image.deinit();
+//
+//      If you don't want to use 'stb_image' library you can disable it in `build.zig`.
+//
+//  7. GUI based on 'dear imgui' library (optional)
+//
+//      zgpu.gui.init(window, gpu_device, "path_to_content_dir", font_name, font_size);
+//      defer zgpu.gui.deinit();
+//
+//      // Main loop
+//      while (...) {
+//          zgpu.gui.newFrame(framebuffer_width, framebuffer_height);
+//          // Define your widgets...
+//          // Draw
+//          {
+//              // Begin render pass with only one color attachment and *no depth-stencil* attachment
+//              const pass = encoder.beginRenderPass(...);
+//              defer {
+//                  pass.end();
+//                  pass.release();
+//              }
+//              zgpu.gui.draw(pass);
+//          }
+//      }
+//
+//      If you don't want to use 'dear imgui' library you can disable it in `build.zig`.
+//
 const std = @import("std");
+const math = std.math;
 const assert = std.debug.assert;
 const glfw = @import("glfw");
 const c = @cImport({
@@ -49,7 +180,7 @@ pub const GraphicsContext = struct {
         } = .{},
     } = .{},
 
-    mipgen: MipgenResources = .{},
+    mipgens: std.AutoHashMap(gpu.Texture.Format, MipgenResources),
 
     pub const swapchain_format = gpu.Texture.Format.bgra8_unorm;
 
@@ -139,6 +270,7 @@ pub const GraphicsContext = struct {
             .bind_group_pool = BindGroupPool.init(allocator, bind_group_pool_size),
             .bind_group_layout_pool = BindGroupLayoutPool.init(allocator, bind_group_layout_pool_size),
             .pipeline_layout_pool = PipelineLayoutPool.init(allocator, pipeline_layout_pool_size),
+            .mipgens = std.AutoHashMap(gpu.Texture.Format, MipgenResources).init(allocator),
         };
 
         gctx.queue.on_submitted_work_done = gpu.Queue.WorkDoneCallback.init(
@@ -171,6 +303,7 @@ pub const GraphicsContext = struct {
             break;
         }
 
+        gctx.mipgens.deinit();
         gctx.pipeline_layout_pool.deinit(allocator);
         gctx.bind_group_pool.deinit(allocator);
         gctx.bind_group_layout_pool.deinit(allocator);
@@ -304,7 +437,7 @@ pub const GraphicsContext = struct {
     }
 
     //
-    // Submit
+    // Submit/Present
     //
     pub fn submit(gctx: *GraphicsContext, commands: []const gpu.CommandBuffer) void {
         const stage_commands = stage_commands: {
@@ -581,7 +714,7 @@ pub const GraphicsContext = struct {
         layout: BindGroupLayoutHandle,
         entries: []const BindGroupEntryInfo,
     ) BindGroupHandle {
-        assert(entries.len > 0 and entries.len < max_num_bindings_per_group);
+        assert(entries.len > 0 and entries.len <= max_num_bindings_per_group);
 
         var bind_group_info = BindGroupInfo{ .num_entries = @intCast(u32, entries.len) };
         var gpu_bind_group_entries: [max_num_bindings_per_group]gpu.BindGroup.Entry = undefined;
@@ -629,7 +762,7 @@ pub const GraphicsContext = struct {
         gctx: *GraphicsContext,
         entries: []const gpu.BindGroupLayout.Entry,
     ) BindGroupLayoutHandle {
-        assert(entries.len > 0 and entries.len < max_num_bindings_per_group);
+        assert(entries.len > 0 and entries.len <= max_num_bindings_per_group);
 
         var bind_group_layout_info = BindGroupLayoutInfo{
             .gpuobj = gctx.device.createBindGroupLayout(&.{ .entries = entries }),
@@ -718,18 +851,27 @@ pub const GraphicsContext = struct {
         return null;
     }
 
+    pub fn releaseResource(gctx: GraphicsContext, handle: anytype) void {
+        const T = @TypeOf(handle);
+        switch (T) {
+            BufferHandle => gctx.buffer_pool.destroyResource(handle, false),
+            TextureHandle => gctx.texture_pool.destroyResource(handle, false),
+            TextureViewHandle => gctx.texture_view_pool.destroyResource(handle, false),
+            SamplerHandle => gctx.sampler_pool.destroyResource(handle, false),
+            RenderPipelineHandle => gctx.render_pipeline_pool.destroyResource(handle, false),
+            ComputePipelineHandle => gctx.compute_pipeline_pool.destroyResource(handle, false),
+            BindGroupHandle => gctx.bind_group_pool.destroyResource(handle, false),
+            BindGroupLayoutHandle => gctx.bind_group_layout_pool.destroyResource(handle, false),
+            PipelineLayoutHandle => gctx.pipeline_layout_pool.destroyResource(handle, false),
+            else => @compileError("[zgpu] GraphicsContext.releaseResource() not implemented for " ++ @typeName(T)),
+        }
+    }
+
     pub fn destroyResource(gctx: GraphicsContext, handle: anytype) void {
         const T = @TypeOf(handle);
         switch (T) {
-            BufferHandle => gctx.buffer_pool.destroyResource(handle),
-            TextureHandle => gctx.texture_pool.destroyResource(handle),
-            TextureViewHandle => gctx.texture_view_pool.destroyResource(handle),
-            SamplerHandle => gctx.sampler_pool.destroyResource(handle),
-            RenderPipelineHandle => gctx.render_pipeline_pool.destroyResource(handle),
-            ComputePipelineHandle => gctx.compute_pipeline_pool.destroyResource(handle),
-            BindGroupHandle => gctx.bind_group_pool.destroyResource(handle),
-            BindGroupLayoutHandle => gctx.bind_group_layout_pool.destroyResource(handle),
-            PipelineLayoutHandle => gctx.pipeline_layout_pool.destroyResource(handle),
+            BufferHandle => gctx.buffer_pool.destroyResource(handle, true),
+            TextureHandle => gctx.texture_pool.destroyResource(handle, true),
             else => @compileError("[zgpu] GraphicsContext.destroyResource() not implemented for " ++ @typeName(T)),
         }
     }
@@ -782,13 +924,13 @@ pub const GraphicsContext = struct {
     const MipgenResources = struct {
         pipeline: ComputePipelineHandle = .{},
         scratch_texture: TextureHandle = .{},
-        scratch_texture_views: [4]TextureViewHandle = [_]TextureViewHandle{.{}} ** 4,
+        scratch_texture_views: [max_levels_per_dispatch]TextureViewHandle =
+            [_]TextureViewHandle{.{}} ** max_levels_per_dispatch,
         bind_group_layout: BindGroupLayoutHandle = .{},
+
+        const max_levels_per_dispatch = 4;
     };
 
-    // TODO: Add support for different texture formats
-    // TODO: Add support for array textures
-    // TODO: Test non-square and non-power-of-two textures
     pub fn generateMipmaps(
         gctx: *GraphicsContext,
         arena: std.mem.Allocator,
@@ -796,20 +938,24 @@ pub const GraphicsContext = struct {
         texture: TextureHandle,
     ) void {
         const texture_info = gctx.lookupResourceInfo(texture) orelse return;
-        if (texture_info.dimension != .dimension_2d or
-            texture_info.mip_level_count == 1 or
-            texture_info.size.width > 2048 or texture_info.size.height > 2048 or
-            texture_info.size.width != texture_info.size.height)
-        {
-            // TODO: Print message.
-            return;
-        }
+        if (texture_info.mip_level_count == 1) return;
 
-        if (!gctx.isResourceValid(gctx.mipgen.pipeline)) {
-            const format = .rgba8_unorm;
-            gctx.mipgen.bind_group_layout = gctx.createBindGroupLayout(&.{
+        const max_size = 2048;
+
+        assert(texture_info.usage.copy_dst == true);
+        assert(texture_info.dimension == .dimension_2d);
+        assert(texture_info.size.width <= max_size and texture_info.size.height <= max_size);
+        assert(texture_info.size.width == texture_info.size.height);
+        assert(math.isPowerOfTwo(texture_info.size.width));
+
+        const format = texture_info.format;
+        const entry = gctx.mipgens.getOrPut(format) catch unreachable;
+        const mipgen = entry.value_ptr;
+
+        if (!entry.found_existing) {
+            mipgen.bind_group_layout = gctx.createBindGroupLayout(&.{
                 bglBuffer(0, .{ .compute = true }, .uniform, true, 0),
-                bglTexture(1, .{ .compute = true }, .float, .dimension_2d, false),
+                bglTexture(1, .{ .compute = true }, .unfilterable_float, .dimension_2d, false),
                 bglStorageTexture(2, .{ .compute = true }, .write_only, format, .dimension_2d),
                 bglStorageTexture(3, .{ .compute = true }, .write_only, format, .dimension_2d),
                 bglStorageTexture(4, .{ .compute = true }, .write_only, format, .dimension_2d),
@@ -817,9 +963,9 @@ pub const GraphicsContext = struct {
             });
 
             const pipeline_layout = gctx.createPipelineLayout(&.{
-                gctx.mipgen.bind_group_layout,
+                mipgen.bind_group_layout,
             });
-            defer gctx.destroyResource(pipeline_layout);
+            defer gctx.releaseResource(pipeline_layout);
 
             const wgsl_src = wgsl.csGenerateMipmaps(arena, formatToShaderFormat(format));
             const cs_module = gctx.device.createShaderModule(&gpu.ShaderModule.Descriptor{
@@ -830,7 +976,7 @@ pub const GraphicsContext = struct {
                 cs_module.release();
             }
 
-            gctx.mipgen.pipeline = gctx.createComputePipeline(pipeline_layout, .{
+            mipgen.pipeline = gctx.createComputePipeline(pipeline_layout, .{
                 .compute = .{
                     .label = "zgpu_cs_generate_mipmaps",
                     .module = cs_module,
@@ -838,17 +984,17 @@ pub const GraphicsContext = struct {
                 },
             });
 
-            gctx.mipgen.scratch_texture = gctx.createTexture(.{
+            mipgen.scratch_texture = gctx.createTexture(.{
                 .usage = .{ .copy_src = true, .storage_binding = true },
                 .dimension = .dimension_2d,
-                .size = .{ .width = 1024, .height = 1024, .depth_or_array_layers = 1 },
+                .size = .{ .width = max_size / 2, .height = max_size / 2, .depth_or_array_layers = 1 },
                 .format = format,
-                .mip_level_count = 4,
+                .mip_level_count = MipgenResources.max_levels_per_dispatch,
                 .sample_count = 1,
             });
 
-            for (gctx.mipgen.scratch_texture_views) |*view, i| {
-                view.* = gctx.createTextureView(gctx.mipgen.scratch_texture, .{
+            for (mipgen.scratch_texture_views) |*view, i| {
+                view.* = gctx.createTextureView(mipgen.scratch_texture, .{
                     .base_mip_level = @intCast(u32, i),
                     .mip_level_count = 1,
                     .base_array_layer = 0,
@@ -857,75 +1003,87 @@ pub const GraphicsContext = struct {
             }
         }
 
-        const texture_view = gctx.createTextureView(texture, .{});
-        defer gctx.destroyResource(texture_view);
+        var array_layer: u32 = 0;
+        while (array_layer < texture_info.size.depth_or_array_layers) : (array_layer += 1) {
+            const texture_view = gctx.createTextureView(texture, .{
+                .dimension = .dimension_2d,
+                .base_array_layer = array_layer,
+                .array_layer_count = 1,
+            });
+            defer gctx.releaseResource(texture_view);
 
-        const bind_group = gctx.createBindGroup(gctx.mipgen.bind_group_layout, &[_]BindGroupEntryInfo{
-            .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = 8 },
-            .{ .binding = 1, .texture_view_handle = texture_view },
-            .{ .binding = 2, .texture_view_handle = gctx.mipgen.scratch_texture_views[0] },
-            .{ .binding = 3, .texture_view_handle = gctx.mipgen.scratch_texture_views[1] },
-            .{ .binding = 4, .texture_view_handle = gctx.mipgen.scratch_texture_views[2] },
-            .{ .binding = 5, .texture_view_handle = gctx.mipgen.scratch_texture_views[3] },
-        });
-        defer gctx.destroyResource(bind_group);
+            const bind_group = gctx.createBindGroup(mipgen.bind_group_layout, &[_]BindGroupEntryInfo{
+                .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = 8 },
+                .{ .binding = 1, .texture_view_handle = texture_view },
+                .{ .binding = 2, .texture_view_handle = mipgen.scratch_texture_views[0] },
+                .{ .binding = 3, .texture_view_handle = mipgen.scratch_texture_views[1] },
+                .{ .binding = 4, .texture_view_handle = mipgen.scratch_texture_views[2] },
+                .{ .binding = 5, .texture_view_handle = mipgen.scratch_texture_views[3] },
+            });
+            defer gctx.releaseResource(bind_group);
 
-        const MipgenUniforms = extern struct {
-            src_mip_level: i32,
-            num_mip_levels: u32,
-        };
-
-        var total_num_mips: u32 = texture_info.mip_level_count - 1;
-        var current_src_mip_level: u32 = 0;
-
-        while (true) {
-            const dispatch_num_mips = std.math.min(4, total_num_mips);
-
-            const mem = gctx.uniformsAllocate(MipgenUniforms, 1);
-            mem.slice[0] = .{
-                .src_mip_level = @intCast(i32, current_src_mip_level),
-                .num_mip_levels = dispatch_num_mips,
+            const MipgenUniforms = extern struct {
+                src_mip_level: i32,
+                num_mip_levels: u32,
             };
 
-            const pass = encoder.beginComputePass(null);
+            var total_num_mips: u32 = texture_info.mip_level_count - 1;
+            var current_src_mip_level: u32 = 0;
 
-            pass.setPipeline(gctx.lookupResource(gctx.mipgen.pipeline).?);
-            pass.setBindGroup(0, gctx.lookupResource(bind_group).?, &.{mem.offset});
-            const num_groups_x = std.math.max(
-                texture_info.size.width >> @intCast(u5, 3 + current_src_mip_level),
-                1,
-            );
-            const num_groups_y = std.math.max(
-                texture_info.size.height >> @intCast(u5, 3 + current_src_mip_level),
-                1,
-            );
-            // TODO: Align up
-            pass.dispatch(num_groups_x, num_groups_y, 1);
+            while (true) {
+                const dispatch_num_mips = math.min(MipgenResources.max_levels_per_dispatch, total_num_mips);
+                {
+                    const pass = encoder.beginComputePass(null);
+                    defer {
+                        pass.end();
+                        pass.release();
+                    }
 
-            pass.end();
-            pass.release();
+                    pass.setPipeline(gctx.lookupResource(mipgen.pipeline).?);
 
-            var mip_index: u32 = 0;
-            while (mip_index < dispatch_num_mips) : (mip_index += 1) {
-                encoder.copyTextureToTexture(
-                    &.{ .texture = gctx.lookupResource(gctx.mipgen.scratch_texture).?, .mip_level = mip_index },
-                    &.{
-                        .texture = gctx.lookupResource(texture).?,
-                        .mip_level = mip_index + current_src_mip_level + 1,
-                    },
-                    &.{
-                        .width = texture_info.size.width >> @intCast(u5, mip_index + current_src_mip_level + 1),
-                        .height = texture_info.size.height >> @intCast(u5, mip_index + current_src_mip_level + 1),
-                    },
-                );
+                    const mem = gctx.uniformsAllocate(MipgenUniforms, 1);
+                    mem.slice[0] = .{
+                        .src_mip_level = @intCast(i32, current_src_mip_level),
+                        .num_mip_levels = dispatch_num_mips,
+                    };
+                    pass.setBindGroup(0, gctx.lookupResource(bind_group).?, &.{mem.offset});
+
+                    pass.dispatch(
+                        math.max(texture_info.size.width >> @intCast(u5, 3 + current_src_mip_level), 1),
+                        math.max(texture_info.size.height >> @intCast(u5, 3 + current_src_mip_level), 1),
+                        1,
+                    );
+                }
+
+                var mip_index: u32 = 0;
+                while (mip_index < dispatch_num_mips) : (mip_index += 1) {
+                    const src_origin = gpu.Origin3D{ .x = 0, .y = 0, .z = 0 };
+                    const dst_origin = gpu.Origin3D{ .x = 0, .y = 0, .z = array_layer };
+                    encoder.copyTextureToTexture(
+                        &.{
+                            .texture = gctx.lookupResource(mipgen.scratch_texture).?,
+                            .mip_level = mip_index,
+                            .origin = src_origin,
+                        },
+                        &.{
+                            .texture = gctx.lookupResource(texture).?,
+                            .mip_level = mip_index + current_src_mip_level + 1,
+                            .origin = dst_origin,
+                        },
+                        &.{
+                            .width = texture_info.size.width >> @intCast(u5, mip_index + current_src_mip_level + 1),
+                            .height = texture_info.size.height >> @intCast(u5, mip_index + current_src_mip_level + 1),
+                        },
+                    );
+                }
+
+                assert(total_num_mips >= dispatch_num_mips);
+                total_num_mips -= dispatch_num_mips;
+                if (total_num_mips == 0) {
+                    break;
+                }
+                current_src_mip_level += dispatch_num_mips;
             }
-
-            assert(total_num_mips >= dispatch_num_mips);
-            total_num_mips -= dispatch_num_mips;
-            if (total_num_mips == 0) {
-                break;
-            }
-            current_src_mip_level += dispatch_num_mips;
         }
     }
 };
@@ -1001,7 +1159,7 @@ pub const BindGroupEntryInfo = struct {
     texture_view_handle: ?TextureViewHandle = null,
 };
 
-const max_num_bindings_per_group = 8;
+const max_num_bindings_per_group = 10;
 
 pub const BindGroupInfo = struct {
     gpuobj: ?gpu.BindGroup = null,
@@ -1094,7 +1252,7 @@ fn ResourcePool(comptime ResourceInfo: type, comptime ResourceHandle: type) type
                     // Check the handle (will always be valid) and its potential dependencies (may be invalid).
                     if (!gctx.isResourceValid(handle)) {
                         // Destroy old resource (it is invalid because some of its dependencies are invalid).
-                        pool.destroyResource(handle);
+                        pool.destroyResource(handle, true);
                         found_slot_index = slot_index;
                         break;
                     }
@@ -1114,13 +1272,13 @@ fn ResourcePool(comptime ResourceInfo: type, comptime ResourceHandle: type) type
             };
         }
 
-        fn destroyResource(pool: Self, handle: ResourceHandle) void {
+        fn destroyResource(pool: Self, handle: ResourceHandle, comptime call_destroy: bool) void {
             if (!pool.isHandleValid(handle))
                 return;
             var resource_info = &pool.resources[handle.index];
 
             const gpuobj = resource_info.gpuobj.?;
-            if (@hasDecl(@TypeOf(gpuobj), "destroy")) {
+            if (call_destroy and @hasDecl(@TypeOf(gpuobj), "destroy")) {
                 gpuobj.destroy();
             }
             gpuobj.release();
@@ -1137,9 +1295,17 @@ fn ResourcePool(comptime ResourceInfo: type, comptime ResourceHandle: type) type
     };
 }
 
-pub fn checkContent(comptime content_dir: []const u8) !void {
+pub fn checkSystem(comptime content_dir: []const u8) !void {
     const local = struct {
-        fn impl() !void {
+        fn impl() error{ GraphicsApiUnavailable, InvalidDataFiles }!void {
+            // TODO: On Windows we should check if DirectX 12 is supported (Windows 10+).
+            // On Linux we require Vulkan support.
+            if (@import("builtin").target.os.tag == .linux) {
+                if (!glfw.vulkanSupported()) {
+                    return error.GraphicsApiUnavailable;
+                }
+                _ = glfw.getRequiredInstanceExtensions() catch return error.GraphicsApiUnavailable;
+            }
             // Change directory to where an executable is located.
             {
                 var exe_path_buffer: [1024]u8 = undefined;
@@ -1148,34 +1314,55 @@ pub fn checkContent(comptime content_dir: []const u8) !void {
             }
             // Make sure font file is a valid data file and not just a Git LFS pointer.
             {
-                const file = try std.fs.cwd().openFile(content_dir ++ "Roboto-Medium.ttf", .{});
+                const file = std.fs.cwd().openFile(
+                    content_dir ++ "Roboto-Medium.ttf",
+                    .{},
+                ) catch return error.InvalidDataFiles;
                 defer file.close();
 
-                const size = @intCast(usize, try file.getEndPos());
+                const size = @intCast(usize, file.getEndPos() catch return error.InvalidDataFiles);
                 if (size <= 1024) {
                     return error.InvalidDataFiles;
                 }
             }
         }
     };
-    local.impl() catch |err| {
-        std.debug.print(
-            \\
-            \\DATA ERROR
-            \\
-            \\Invalid data files or missing content folder.
-            \\Please install Git LFS (Large File Support) and run (in the repo):
-            \\
-            \\git lfs install
-            \\git pull
-            \\
-            \\For more info please see: https://git-lfs.github.com/
-            \\
-            \\
-        ,
-            .{},
-        );
-        return err;
+    local.impl() catch |err| switch (err) {
+        error.GraphicsApiUnavailable => {
+            std.debug.print(
+                \\
+                \\GRAPHICS ERROR
+                \\
+                \\This program requires:
+                \\
+                \\  * DirectX 12 graphics driver on Windows
+                \\  * Vulkan graphics driver on Linux (OpenGL is NOT supported)
+                \\  * Metal graphics driver on MacOS
+                \\
+                \\Please install latest supported driver and try again.
+                \\
+                \\
+            , .{});
+            return err;
+        },
+        error.InvalidDataFiles => {
+            std.debug.print(
+                \\
+                \\DATA ERROR
+                \\
+                \\Invalid data files or missing content folder.
+                \\Please install Git LFS (Large File Support) and run (in the repo):
+                \\
+                \\git lfs install
+                \\git lfs pull
+                \\
+                \\For more info please see: https://git-lfs.github.com/
+                \\
+                \\
+            , .{});
+            return err;
+        },
+        else => unreachable,
     };
 }
 
@@ -1211,6 +1398,9 @@ const FrameStats = struct {
 };
 
 pub const gui = struct {
+    /// This call will install GLFW callbacks to handle GUI interactions.
+    /// Those callbacks will chain-call user's previously installed callbacks, if any.
+    /// This means that custom user's callbacks need to be installed *before* calling zgpu.gui.init().
     pub fn init(
         window: glfw.Window,
         device: gpu.Device,
@@ -1283,41 +1473,75 @@ pub const gui = struct {
 };
 
 pub const stbi = struct {
-    pub const Image = struct {
-        data: []u8,
-        width: u32,
-        height: u32,
-        channels_in_memory: u32,
-        channels_in_file: u32,
+    pub fn Image(comptime ChannelType: type) type {
+        return struct {
+            const Self = @This();
 
-        pub fn init(
-            filename: [*:0]const u8,
-            desired_channels: u32,
-        ) !Image {
-            var x: c_int = undefined;
-            var y: c_int = undefined;
-            var ch: c_int = undefined;
-            const data = stbi_load(filename, &x, &y, &ch, @intCast(c_int, desired_channels));
-            if (data == null)
-                return error.stbi_LoadFailed;
+            data: []ChannelType,
+            width: u32,
+            height: u32,
+            bytes_per_row: u32,
+            channels_in_memory: u32,
+            channels_in_file: u32,
 
-            const channels_in_memory = if (desired_channels == 0) @intCast(u32, ch) else desired_channels;
-            const width = @intCast(u32, x);
-            const height = @intCast(u32, y);
-            return Image{
-                .data = data.?[0 .. width * height * channels_in_memory],
-                .width = width,
-                .height = height,
-                .channels_in_memory = channels_in_memory,
-                .channels_in_file = @intCast(u32, ch),
-            };
-        }
+            pub fn init(
+                filename: [*:0]const u8,
+                desired_channels: u32,
+            ) !Self {
+                var x: c_int = undefined;
+                var y: c_int = undefined;
+                var ch: c_int = undefined;
+                var data = switch (ChannelType) {
+                    u8 => stbi_load(filename, &x, &y, &ch, @intCast(c_int, desired_channels)),
+                    f16 => @ptrCast(?[*]f16, stbi_loadf(filename, &x, &y, &ch, @intCast(c_int, desired_channels))),
+                    f32 => stbi_loadf(filename, &x, &y, &ch, @intCast(c_int, desired_channels)),
+                    else => @compileError("[zgpu] stbi.Image: ChannelType can be u8, f16 or f32."),
+                };
+                if (data == null)
+                    return error.StbiLoadFailed;
 
-        pub fn deinit(image: *Image) void {
-            stbi_image_free(image.data.ptr);
-            image.* = undefined;
-        }
-    };
+                const channels_in_memory = if (desired_channels == 0) @intCast(u32, ch) else desired_channels;
+                const width = @intCast(u32, x);
+                const height = @intCast(u32, y);
+
+                if (ChannelType == f16) {
+                    var data_f32 = @ptrCast([*]f32, data.?);
+                    const num = width * height * channels_in_memory;
+                    var i: u32 = 0;
+                    while (i < num) : (i += 1) {
+                        data.?[i] = @floatCast(f16, data_f32[i]);
+                    }
+                }
+
+                return Self{
+                    .data = data.?[0 .. width * height * channels_in_memory],
+                    .width = width,
+                    .height = height,
+                    .bytes_per_row = width * channels_in_memory * @sizeOf(ChannelType),
+                    .channels_in_memory = channels_in_memory,
+                    .channels_in_file = @intCast(u32, ch),
+                };
+            }
+
+            pub fn deinit(image: *Self) void {
+                stbi_image_free(image.data.ptr);
+                image.* = undefined;
+            }
+        };
+    }
+
+    pub const hdrToLdrScale = stbi_hdr_to_ldr_scale;
+    pub const hdrToLdrGamma = stbi_hdr_to_ldr_gamma;
+    pub const ldrToHdrScale = stbi_ldr_to_hdr_scale;
+    pub const ldrToHdrGamma = stbi_ldr_to_hdr_gamma;
+
+    pub fn isHdr(filename: [*:0]const u8) bool {
+        return stbi_is_hdr(filename) == 1;
+    }
+
+    pub fn setFlipVerticallyOnLoad(should_flip: bool) void {
+        stbi_set_flip_vertically_on_load(if (should_flip) 1 else 0);
+    }
 
     extern fn stbi_load(
         filename: [*:0]const u8,
@@ -1326,7 +1550,24 @@ pub const stbi = struct {
         channels_in_file: *c_int,
         desired_channels: c_int,
     ) ?[*]u8;
+
+    extern fn stbi_loadf(
+        filename: [*:0]const u8,
+        x: *c_int,
+        y: *c_int,
+        channels_in_file: *c_int,
+        desired_channels: c_int,
+    ) ?[*]f32;
+
     extern fn stbi_image_free(image_data: ?*anyopaque) void;
+
+    extern fn stbi_hdr_to_ldr_scale(scale: f32) void;
+    extern fn stbi_hdr_to_ldr_gamma(gamma: f32) void;
+    extern fn stbi_ldr_to_hdr_scale(scale: f32) void;
+    extern fn stbi_ldr_to_hdr_gamma(gamma: f32) void;
+
+    extern fn stbi_is_hdr(filename: [*:0]const u8) c_int;
+    extern fn stbi_set_flip_vertically_on_load(flag_true_if_should_flip: c_int) void;
 };
 
 fn detectGLFWOptions() glfw.BackendOptions {

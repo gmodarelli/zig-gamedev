@@ -7,10 +7,21 @@ pub fn build(b: *std.build.Builder) void {
         .target = b.standardTargetOptions(.{}),
     };
 
-    options.enable_tracy = b.option(bool, "enable-tracy", "Enable Tracy profiler") orelse false;
-    options.dawn_from_source = b.option(bool, "dawn-from-source", "Build Dawn (WebGPU) from source") orelse false;
+    options.ztracy_enable = b.option(bool, "ztracy-enable", "Enable Tracy profiler") orelse false;
+    options.zgpu_dawn_from_source = b.option(
+        bool,
+        "zgpu-dawn-from-source",
+        "Build Dawn (WebGPU) from source",
+    ) orelse false;
 
-    if (options.dawn_from_source) {
+    // TODO: Remove this
+    // On macOS you must compile with `-Dzgpu-dawn-from-source=true`
+    // (this will be fixed shortly)
+    if (@import("builtin").os.tag == .macos) {
+        options.zgpu_dawn_from_source = true;
+    }
+
+    if (options.zgpu_dawn_from_source) {
         ensureSubmodules(b.allocator) catch |err| @panic(@errorName(err));
     }
 
@@ -21,12 +32,14 @@ pub fn build(b: *std.build.Builder) void {
     installDemo(b, triangle_wgpu.build(b, options), "triangle_wgpu");
     installDemo(b, procedural_mesh_wgpu.build(b, options), "procedural_mesh_wgpu");
     installDemo(b, textured_quad_wgpu.build(b, options), "textured_quad_wgpu");
+    installDemo(b, physically_based_rendering_wgpu.build(b, options), "physically_based_rendering_wgpu");
+    installDemo(b, bullet_physics_test_wgpu.build(b, options), "bullet_physics_test_wgpu");
 
     //
     // Windows-only demos
     //
     if (options.target.isWindows()) {
-        options.enable_pix = b.option(bool, "enable-pix", "Enable PIX GPU events and markers") orelse false;
+        options.zpix_enable = b.option(bool, "zpix-enable", "Enable PIX GPU events and markers") orelse false;
         options.enable_dx_debug = b.option(
             bool,
             "enable-dx-debug",
@@ -69,14 +82,16 @@ pub fn build(b: *std.build.Builder) void {
     const zmesh_tests = @import("libs/zmesh/build.zig").buildTests(b, options.build_mode, options.target);
     const zmath_tests = @import("libs/zmath/build.zig").buildTests(b, options.build_mode, options.target);
     const znoise_tests = @import("libs/znoise/build.zig").buildTests(b, options.build_mode, options.target);
-    const zenet_tests = @import("libs/zenet/build.zig").buildTests(b, options.build_mode, options.target);
+    const znetwork_tests = @import("libs/znetwork/build.zig").buildTests(b, options.build_mode, options.target);
+    const zpool_tests = @import("libs/zpool/build.zig").buildTests(b, options.build_mode, options.target);
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&zbullet_tests.step);
     test_step.dependOn(&zmesh_tests.step);
     test_step.dependOn(&zmath_tests.step);
     test_step.dependOn(&znoise_tests.step);
-    test_step.dependOn(&zenet_tests.step);
+    test_step.dependOn(&znetwork_tests.step);
+    test_step.dependOn(&zpool_tests.step);
 }
 
 const audio_experiments = @import("samples/audio_experiments/build.zig");
@@ -100,15 +115,19 @@ const triangle_wgpu = @import("samples/triangle_wgpu/build.zig");
 const procedural_mesh_wgpu = @import("samples/procedural_mesh_wgpu/build.zig");
 const deferred = @import("samples/deferred/build.zig");
 const textured_quad_wgpu = @import("samples/textured_quad_wgpu/build.zig");
+const physically_based_rendering_wgpu = @import("samples/physically_based_rendering_wgpu/build.zig");
+const bullet_physics_test_wgpu = @import("samples/bullet_physics_test_wgpu/build.zig");
 
 pub const Options = struct {
     build_mode: std.builtin.Mode,
     target: std.zig.CrossTarget,
+
+    ztracy_enable: bool = false,
+    zpix_enable: bool = false,
+    zgpu_dawn_from_source: bool = false,
+
     enable_dx_debug: bool = false,
     enable_dx_gpu_debug: bool = false,
-    enable_tracy: bool = false,
-    enable_pix: bool = false,
-    dawn_from_source: bool = false,
 };
 
 fn installDemo(b: *std.build.Builder, exe: *std.build.LibExeObjStep, comptime name: []const u8) void {
@@ -138,5 +157,7 @@ fn ensureSubmodules(allocator: std.mem.Allocator) !void {
 }
 
 fn thisDir() []const u8 {
-    return std.fs.path.dirname(@src().file) orelse ".";
+    comptime {
+        return std.fs.path.dirname(@src().file) orelse ".";
+    }
 }

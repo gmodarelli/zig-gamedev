@@ -4,6 +4,9 @@
 #include "btBulletCollisionCommon.h"
 #include "btBulletDynamicsCommon.h"
 #include "BulletDynamics/ConstraintSolver/btContactConstraint.h"
+#include "BulletDynamics/ConstraintSolver/btSequentialImpulseConstraintSolverMt.h"
+#include "BulletDynamics/Dynamics/btDiscreteDynamicsWorldMt.h"
+#include "BulletCollision/CollisionDispatch/btCollisionDispatcherMt.h"
 
 void cbtAlignedAllocSetCustom(CbtAllocFunc alloc, CbtFreeFunc free) {
     btAlignedAllocSetCustom(alloc, free);
@@ -71,36 +74,101 @@ struct DebugDraw : public btIDebugDraw {
 };
 
 struct WorldData {
-    btDiscreteDynamicsWorld* world;
+    btDiscreteDynamicsWorld* world = nullptr;
+    btDefaultCollisionConfiguration* collision_config = nullptr;
+    btCollisionDispatcher* dispatcher = nullptr;
+    btDbvtBroadphase* broadphase = nullptr;
+    btSequentialImpulseConstraintSolver* solver = nullptr;
+
+    btConstraintSolverPoolMt* solver_pool = nullptr;
     DebugDraw* debug = nullptr;
 };
 
+static btITaskScheduler* s_task_scheduler = nullptr;
+
+void cbtTaskSchedInit(void) {
+    assert(s_task_scheduler == nullptr);
+    s_task_scheduler = btCreateDefaultTaskScheduler();
+    btSetTaskScheduler(s_task_scheduler);
+}
+
+void cbtTaskSchedDeinit(void) {
+    assert(s_task_scheduler != nullptr);
+    btSetTaskScheduler(nullptr);
+    delete s_task_scheduler;
+    s_task_scheduler = nullptr;
+}
+
+int cbtTaskSchedGetNumThreads(void) {
+    assert(s_task_scheduler != nullptr);
+    return s_task_scheduler->getNumThreads();
+}
+
+int cbtTaskSchedGetMaxNumThreads(void) {
+    assert(s_task_scheduler != nullptr);
+    return s_task_scheduler->getMaxNumThreads();
+}
+
+void cbtTaskSchedSetNumThreads(int num_threads) {
+    assert(s_task_scheduler != nullptr);
+    s_task_scheduler->setNumThreads(num_threads);
+}
+
 CbtWorldHandle cbtWorldCreate(void) {
     // TODO: Check for oom errors.
-
-    auto collision_config = (btDefaultCollisionConfiguration*)btAlignedAlloc(
-        sizeof(btDefaultCollisionConfiguration),
-        16
-    );
-    new (collision_config) btDefaultCollisionConfiguration();
-
-    auto dispatcher = (btCollisionDispatcher*)btAlignedAlloc(sizeof(btCollisionDispatcher), 16);
-    new (dispatcher) btCollisionDispatcher(collision_config);
-
-    auto broadphase = (btDbvtBroadphase*)btAlignedAlloc(sizeof(btDbvtBroadphase), 16);
-    new (broadphase) btDbvtBroadphase();
-
-    auto solver = (btSequentialImpulseConstraintSolver*)btAlignedAlloc(
-        sizeof(btSequentialImpulseConstraintSolver),
-        16
-    );
-    new (solver) btSequentialImpulseConstraintSolver();
-
     auto world_data = (WorldData*)btAlignedAlloc(sizeof(WorldData), 16);
     new (world_data) WorldData();
 
-    world_data->world = (btDiscreteDynamicsWorld*)btAlignedAlloc(sizeof(btDiscreteDynamicsWorld), 16);
-    new (world_data->world) btDiscreteDynamicsWorld(dispatcher, broadphase, solver, collision_config);
+    world_data->collision_config = (btDefaultCollisionConfiguration*)btAlignedAlloc(
+        sizeof(btDefaultCollisionConfiguration),
+        16
+    );
+    world_data->broadphase = (btDbvtBroadphase*)btAlignedAlloc(sizeof(btDbvtBroadphase), 16);
+
+    new (world_data->collision_config) btDefaultCollisionConfiguration();
+    new (world_data->broadphase) btDbvtBroadphase();
+
+    if (s_task_scheduler == nullptr) {
+        world_data->dispatcher = (btCollisionDispatcher*)btAlignedAlloc(sizeof(btCollisionDispatcher), 16);
+        world_data->solver = (btSequentialImpulseConstraintSolver*)btAlignedAlloc(
+            sizeof(btSequentialImpulseConstraintSolver),
+            16
+        );
+        world_data->world = (btDiscreteDynamicsWorld*)btAlignedAlloc(sizeof(btDiscreteDynamicsWorld), 16);
+
+        new (world_data->dispatcher) btCollisionDispatcher(world_data->collision_config);
+        new (world_data->solver) btSequentialImpulseConstraintSolver();
+
+        new (world_data->world) btDiscreteDynamicsWorld(
+            world_data->dispatcher,
+            world_data->broadphase,
+            world_data->solver,
+            world_data->collision_config
+        );
+    } else {
+        world_data->dispatcher = (btCollisionDispatcherMt*)btAlignedAlloc(sizeof(btCollisionDispatcherMt), 16);
+        world_data->solver_pool = (btConstraintSolverPoolMt*)btAlignedAlloc(
+            sizeof(btConstraintSolverPoolMt),
+            16
+        );
+        world_data->solver = (btSequentialImpulseConstraintSolverMt*)btAlignedAlloc(
+            sizeof(btSequentialImpulseConstraintSolverMt),
+            16
+        );
+        world_data->world = (btDiscreteDynamicsWorldMt*)btAlignedAlloc(sizeof(btDiscreteDynamicsWorldMt), 16);
+
+        new (world_data->dispatcher) btCollisionDispatcherMt(world_data->collision_config);
+        new (world_data->solver_pool) btConstraintSolverPoolMt(s_task_scheduler->getNumThreads());
+        new (world_data->solver) btSequentialImpulseConstraintSolverMt();
+
+        new (world_data->world) btDiscreteDynamicsWorldMt(
+            world_data->dispatcher,
+            world_data->broadphase,
+            world_data->solver_pool,
+            world_data->solver,
+            world_data->collision_config
+        );
+    }
 
     return (CbtWorldHandle)world_data;
 }
@@ -108,24 +176,23 @@ CbtWorldHandle cbtWorldCreate(void) {
 void cbtWorldDestroy(CbtWorldHandle world_handle) {
     assert(world_handle);
     auto world_data = (WorldData*)world_handle;
-    auto world = world_data->world;
 
-    auto dispatcher = (btCollisionDispatcher*)world->getDispatcher();
-    auto collision_config = (btDefaultCollisionConfiguration*)dispatcher->getCollisionConfiguration();
-    auto broadphase = (btDbvtBroadphase*)world->getBroadphase();
-    auto solver = (btSequentialImpulseConstraintSolver*)world->getConstraintSolver();
+    world_data->dispatcher->~btCollisionDispatcher();
+    world_data->collision_config->~btDefaultCollisionConfiguration();
+    world_data->broadphase->~btDbvtBroadphase();
+    world_data->solver->~btSequentialImpulseConstraintSolver();
+    world_data->world->~btDiscreteDynamicsWorld();
 
-    dispatcher->~btCollisionDispatcher();
-    collision_config->~btDefaultCollisionConfiguration();
-    broadphase->~btDbvtBroadphase();
-    solver->~btSequentialImpulseConstraintSolver();
-    world->~btDiscreteDynamicsWorld();
+    btAlignedFree(world_data->dispatcher);
+    btAlignedFree(world_data->collision_config);
+    btAlignedFree(world_data->broadphase);
+    btAlignedFree(world_data->solver);
+    btAlignedFree(world_data->world);
 
-    btAlignedFree(dispatcher);
-    btAlignedFree(collision_config);
-    btAlignedFree(broadphase);
-    btAlignedFree(solver);
-    btAlignedFree(world);
+    if (world_data->solver_pool != nullptr) {
+        world_data->solver_pool->~btConstraintSolverPoolMt();
+        btAlignedFree(world_data->solver_pool);
+    }
 
     if (world_data->debug) {
         world_data->debug->~DebugDraw();

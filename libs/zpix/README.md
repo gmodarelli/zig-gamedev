@@ -2,30 +2,29 @@
 
 ## Getting started
 
-Copy `zpix` and `zwin32` folders to a `libs` subdirectory of the root of your project.
+Copy `zpix` folder to a `libs` subdirectory of the root of your project.
 
 Then in your `build.zig` add:
 
 ```zig
 const std = @import("std");
-const zwin32 = @import("libs/zwin32/build.zig");
 const zpix = @import("libs/zpix/build.zig");
 
 pub fn build(b: *std.build.Builder) void {
     ...
-    const enable_pix = b.option(bool, "enable-pix", "Enable PIX GPU events and markers") orelse false;
+    const zpix_enable = b.option(bool, "zpix-enable", "Enable PIX GPU events and markers") orelse false;
 
-    const exe_options = b.addOptions();
-    exe_options.addOption(bool, "enable_pix", enable_pix);
-    exe.addOptions("build_options", exe_options);
+    const zpix_options = zpix.BuildOptionsStep.init(b, .{ .enable_zpix = options.zpix_enable });
 
-    const options_pkg = exe_options.getPackage("build_options");
-    exe.addPackage(zwin32.pkg);
-    exe.addPackage(zpix.getPkg(b, options_pkg));
+    const zpix_pkg = zpix.getPkg(&.{zpix_options.getPkg()});
+
+    exe.addPackage(zpix_pkg);
+
+    zpix.link(exe, zpix_options);
 }
 ```
 
-Now in your code you may import and use zpix:
+Now in your code you may import and use `zpix`:
 
 ```zig
 const zpix = @import("zpix");

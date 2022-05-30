@@ -82,7 +82,7 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !*DemoState {
         zgpu.bglTexture(1, .{ .fragment = true }, .float, .dimension_2d, false),
         zgpu.bglSampler(2, .{ .fragment = true }, .filtering),
     });
-    defer gctx.destroyResource(bind_group_layout);
+    defer gctx.releaseResource(bind_group_layout);
 
     // Create a vertex buffer.
     const vertex_data = [_]Vertex{
@@ -106,7 +106,7 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !*DemoState {
     gctx.queue.writeBuffer(gctx.lookupResource(index_buffer).?, 0, u16, index_data[0..]);
 
     // Create a texture.
-    var image = try zgpu.stbi.Image.init(content_dir ++ "genart_0025_5.png", 4);
+    var image = try zgpu.stbi.Image(u8).init(content_dir ++ "genart_0025_5.png", 4);
     defer image.deinit();
 
     const texture = gctx.createTexture(.{
@@ -123,12 +123,13 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !*DemoState {
 
     gctx.queue.writeTexture(
         &.{ .texture = gctx.lookupResource(texture).? },
-        image.data,
         &.{
             .bytes_per_row = image.width * image.channels_in_memory,
             .rows_per_image = image.height,
         },
         &.{ .width = image.width, .height = image.height },
+        u8,
+        image.data,
     );
 
     // Create a sampler.
@@ -170,7 +171,7 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !*DemoState {
         const pipeline_layout = gctx.createPipelineLayout(&.{
             bind_group_layout,
         });
-        defer gctx.destroyResource(pipeline_layout);
+        defer gctx.releaseResource(pipeline_layout);
 
         const vs_module = gctx.device.createShaderModule(&.{ .label = "vs", .code = .{ .wgsl = wgsl_vs } });
         defer vs_module.release();
@@ -318,13 +319,13 @@ fn draw(demo: *DemoState) void {
 }
 
 pub fn main() !void {
-    zgpu.checkContent(content_dir) catch {
-        // In case of error zgpu.checkContent() will print error message.
-        return;
-    };
-
     try glfw.init(.{});
     defer glfw.terminate();
+
+    zgpu.checkSystem(content_dir) catch {
+        // In case of error zgpu.checkSystem() will print error message.
+        return;
+    };
 
     const window = try glfw.Window.create(1280, 960, window_title, null, null, .{
         .client_api = .no_api,

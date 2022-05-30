@@ -43,7 +43,7 @@ pub const Options = struct {
 
 pub const pkg = std.build.Pkg{
     .name = "glfw",
-    .path = .{ .path = thisDir() ++ "/src/main.zig" },
+    .source = .{ .path = thisDir() ++ "/src/main.zig" },
 };
 
 pub fn link(b: *Builder, step: *std.build.LibExeObjStep, options: Options) void {
@@ -97,7 +97,9 @@ fn buildLibrary(b: *Builder, step: *std.build.LibExeObjStep, options: Options) *
 }
 
 fn thisDir() []const u8 {
-    return std.fs.path.dirname(@src().file) orelse ".";
+    comptime {
+        return std.fs.path.dirname(@src().file) orelse ".";
+    }
 }
 
 fn linkGLFWDependencies(b: *Builder, step: *std.build.LibExeObjStep, options: Options) void {

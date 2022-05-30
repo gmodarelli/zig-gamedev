@@ -137,6 +137,15 @@ typedef struct CbtRayCastResult {
 } CbtRayCastResult;
 
 //
+// Task scheduler
+//
+void cbtTaskSchedInit(void);
+void cbtTaskSchedDeinit(void);
+int cbtTaskSchedGetNumThreads(void);
+int cbtTaskSchedGetMaxNumThreads(void);
+void cbtTaskSchedSetNumThreads(int num_threads);
+
+//
 // World
 //
 CbtWorldHandle cbtWorldCreate(void);

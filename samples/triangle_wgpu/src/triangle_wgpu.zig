@@ -60,10 +60,10 @@ fn init(allocator: std.mem.Allocator, window: glfw.Window) !DemoState {
     const bind_group_layout = gctx.createBindGroupLayout(&.{
         zgpu.bglBuffer(0, .{ .vertex = true }, .uniform, true, 0),
     });
-    defer gctx.destroyResource(bind_group_layout);
+    defer gctx.releaseResource(bind_group_layout);
 
     const pipeline_layout = gctx.createPipelineLayout(&.{bind_group_layout});
-    defer gctx.destroyResource(bind_group_layout);
+    defer gctx.releaseResource(pipeline_layout);
 
     const pipeline = pipline: {
         const vs_module = gctx.device.createShaderModule(&.{ .label = "vs", .code = .{ .wgsl = wgsl_vs } });
@@ -270,7 +270,7 @@ fn draw(demo: *DemoState) void {
 
     if (gctx.present() == .swap_chain_resized) {
         // Release old depth texture.
-        gctx.destroyResource(demo.depth_texture_view);
+        gctx.releaseResource(demo.depth_texture_view);
         gctx.destroyResource(demo.depth_texture);
 
         // Create a new depth texture to match the new window size.
@@ -301,13 +301,13 @@ fn createDepthTexture(gctx: *zgpu.GraphicsContext) struct {
 }
 
 pub fn main() !void {
-    zgpu.checkContent(content_dir) catch {
-        // In case of error zgpu.checkContent() will print error message.
-        return;
-    };
-
     try glfw.init(.{});
     defer glfw.terminate();
+
+    zgpu.checkSystem(content_dir) catch {
+        // In case of error zgpu.checkSystem() will print error message.
+        return;
+    };
 
     const window = try glfw.Window.create(1280, 960, window_title, null, null, .{
         .client_api = .no_api,

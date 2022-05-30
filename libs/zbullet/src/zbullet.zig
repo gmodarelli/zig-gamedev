@@ -42,15 +42,20 @@ export fn zbulletFree(ptr: ?*anyopaque) callconv(.C) void {
     }
 }
 
+extern fn cbtTaskSchedInit() void;
+extern fn cbtTaskSchedDeinit() void;
+
 pub fn init(alloc: std.mem.Allocator) void {
     std.debug.assert(allocator == null and allocations == null);
     allocator = alloc;
     allocations = std.AutoHashMap(usize, usize).init(allocator.?);
     allocations.?.ensureTotalCapacity(256) catch @panic("zbullet: out of memory");
     cbtAlignedAllocSetCustomAligned(zbulletAlloc, zbulletFree);
+    cbtTaskSchedInit();
 }
 
 pub fn deinit() void {
+    cbtTaskSchedDeinit();
     allocations.?.deinit();
     allocations = null;
     allocator = null;

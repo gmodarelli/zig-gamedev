@@ -9,21 +9,20 @@ const Options = @import("../../build.zig").Options;
 const content_dir = "physically_based_rendering_content/";
 
 pub fn build(b: *std.build.Builder, options: Options) *std.build.LibExeObjStep {
-    const exe_options = b.addOptions();
-    exe_options.addOption(bool, "enable_pix", options.enable_pix);
-    exe_options.addOption(bool, "enable_dx_debug", options.enable_dx_debug);
-    exe_options.addOption(bool, "enable_dx_gpu_debug", options.enable_dx_gpu_debug);
-    exe_options.addOption(bool, "enable_tracy", options.enable_tracy);
-    exe_options.addOption(bool, "enable_d2d", false);
-    exe_options.addOption([]const u8, "content_dir", content_dir);
-
     const exe = b.addExecutable(
         "physically_based_rendering",
         thisDir() ++ "/src/physically_based_rendering.zig",
     );
+
+    const exe_options = b.addOptions();
+    exe.addOptions("build_options", exe_options);
+    exe_options.addOption(bool, "enable_dx_debug", options.enable_dx_debug);
+    exe_options.addOption(bool, "enable_dx_gpu_debug", options.enable_dx_gpu_debug);
+    exe_options.addOption(bool, "enable_d2d", false);
+    exe_options.addOption([]const u8, "content_dir", content_dir);
+
     exe.setBuildMode(options.build_mode);
     exe.setTarget(options.target);
-    exe.addOptions("build_options", exe_options);
 
     const dxc_step = buildShaders(b);
     const install_content_step = b.addInstallDirectory(.{
@@ -40,16 +39,24 @@ pub fn build(b: *std.build.Builder, options: Options) *std.build.LibExeObjStep {
     exe.rdynamic = true;
     exe.want_lto = false;
 
+    const zmesh_options = zmesh.BuildOptionsStep.init(b, .{});
+    const ztracy_options = ztracy.BuildOptionsStep.init(b, .{ .enable_ztracy = options.ztracy_enable });
+
     const options_pkg = exe_options.getPackage("build_options");
-    exe.addPackage(ztracy.getPkg(b, options_pkg));
-    exe.addPackage(zd3d12.getPkg(b, options_pkg));
-    exe.addPackage(common.getPkg(b, options_pkg));
-    exe.addPackage(zmesh.pkg);
+    const ztracy_pkg = ztracy.getPkg(&.{ztracy_options.getPkg()});
+    const zd3d12_pkg = zd3d12.getPkg(&.{ ztracy_pkg, zwin32.pkg, options_pkg });
+    const common_pkg = common.getPkg(&.{ zd3d12_pkg, ztracy_pkg, zwin32.pkg, options_pkg });
+    const zmesh_pkg = zmesh.getPkg(&.{zmesh_options.getPkg()});
+
+    exe.addPackage(zmesh_pkg);
+    exe.addPackage(ztracy_pkg);
+    exe.addPackage(zd3d12_pkg);
+    exe.addPackage(common_pkg);
     exe.addPackage(zwin32.pkg);
 
-    ztracy.link(exe, options.enable_tracy, .{});
+    ztracy.link(exe, ztracy_options);
+    zmesh.link(exe, zmesh_options);
     zd3d12.link(exe);
-    zmesh.link(exe);
     common.link(exe);
 
     return exe;
@@ -204,5 +211,7 @@ fn makeDxcCmd(
 }
 
 fn thisDir() []const u8 {
-    return std.fs.path.dirname(@src().file) orelse ".";
+    comptime {
+        return std.fs.path.dirname(@src().file) orelse ".";
+    }
 }
